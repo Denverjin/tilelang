@@ -287,6 +287,14 @@ def copy(  # noqa: A001
             ``T.ascend_set_copy_pad_value(...)`` beforehand.
         annotations (Optional[dict], keyword-only): Additional annotations
             dict; values in it take precedence over the individual keywords.
+            ``{"emit_zero_burst": True}`` skips the empty-region guard for
+            an unpadded GM→UB DMA outside SimtVF. Requires fixed positive row
+            bytes and a DMA row count that captures all empty-region conditions;
+            unsupported geometry raises a lowering error. The caller must
+            supply nonnegative, hardware-valid counts and address/stride
+            expressions safe to evaluate even for zero rows. Zero bursts
+            preserve UB contents. Compile-time-empty copies may be eliminated.
+            Defaults to False.
         loop_layout (Optional[Fragment], keyword-only): Parallel loop layout
             hint for the SIMT copy path.
 

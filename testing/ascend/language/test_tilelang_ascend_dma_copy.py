@@ -40,6 +40,36 @@ def test_dynamic_rows_with_fixed_middle_axis(rows):
     torch.testing.assert_close(dst, expected)
 
 
+@tilelang.testing.requires_ascend
+def test_gm_to_ub_emit_zero_burst_preserves_destination():
+    src_pitch = T.dynamic("src_pitch", dtype="int64")
+
+    @T.prim_func
+    def copy(
+        src: T.StridedTensor((2, 16), (src_pitch, 1), "int32"),
+        seed: T.Tensor((2, 24), "int32"),
+        dst: T.Tensor((2, 24), "int32"),
+        valid: T.int32,
+    ):
+        with T.Kernel(1):
+            ub = T.alloc_shared((2, 24), "int32")
+            T.copy(seed, ub)
+            rows = T.if_then_else(valid != 0, 2, 0)
+            T.copy(src[:rows, :], ub[:rows, :16], annotations={"emit_zero_burst": True})
+            T.copy(ub, dst)
+
+    kernel = tilelang.compile(copy, out_idx=2, target="ascend")
+    seed = torch.arange(48, dtype=torch.int32, device="npu").reshape(2, 24) + 1000
+    for width in (32, 48):
+        storage = torch.arange(2 * width, dtype=torch.int32, device="npu").reshape(2, width)
+        src = storage[:, :16]
+        for valid in (1, 0, 1):
+            expected = seed.clone()
+            if valid:
+                expected[:, :16] = src
+            torch.testing.assert_close(kernel(src, seed, valid), expected)
+
+
 def l0c_to_strided_gm_copy():
     ldd = T.dynamic("ldd", dtype="int64")
     m, n, k = 16, 16, 64

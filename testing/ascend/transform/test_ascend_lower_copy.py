@@ -131,6 +131,66 @@ def test_dynamic_rows_keep_the_stride_across_a_fixed_middle_axis():
         assert bool(tvm.arith.Analyzer().simplify(condition)) == (count > 0)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("count_expr", ["select", "scalar"])
+def test_zero_burst_annotation_controls_only_the_dma_guard(enabled, count_expr):
+    valid = tirx.Var("valid", "bool")
+    rows = tirx.if_then_else(valid, 2, 0) if count_expr == "select" else tirx.Var("rows", "int32")
+    src_pitch = tirx.Var("src_pitch", "int64")
+    src = tirx.decl_buffer((4, 32), "float32", name="src", strides=(src_pitch, 1))
+    dst = tirx.decl_buffer((4, 64), "float32", name="dst", scope="shared.dyn")
+    after = _lower(
+        src,
+        dst,
+        _region(src, [rows, 32], [1, 0]),
+        _region(dst, [rows, 32], [1, 0]),
+        annotations={"emit_zero_burst": enabled, "l2_cache_ctrl": 5},
+    )
+    (copy,) = calls(after, "tl.ascend_copy_gm_to_ubuf")
+    _equal([copy.args[i] for i in (3, 4, 8, 9, 10)], [rows, 128, 5, src_pitch * 4, 256])
+    _equal([copy.args[0].args[2], copy.args[1].args[2]], [64, src_pitch])
+    guards = nodes(after, tirx.IfThenElse)
+    assert len(guards) == (0 if enabled else 1)
+    if guards:
+        _equal([guards[0].condition], [rows > 0])
+
+
+@pytest.mark.parametrize(
+    "case,diagnostic",
+    [
+        ("store", "requires unpadded GM->UB DMA"),
+        ("padding", "requires unpadded GM->UB DMA"),
+        ("pad-value", "requires unpadded GM->UB DMA"),
+        ("simtvf", "outside SimtVF"),
+        ("symbolic-width", "statically-known positive DMA row byte length"),
+        ("extra-empty-axis", "every possibly-empty axis"),
+        ("normalized-zero-or-one", "every possibly-empty axis"),
+    ],
+)
+def test_zero_burst_rejects_unsupported_requests(case, diagnostic):
+    rows = tirx.Select(tirx.Var("valid", "bool"), 1 if case == "normalized-zero-or-one" else 2, 0)
+    cols = tirx.Var("cols", "int32") if case == "symbolic-width" else 32
+    src = tirx.decl_buffer((4, 64), "float32", name="src", scope="shared.dyn" if case == "store" else "global")
+    dst_scope = "global" if case == "store" else "shared.dyn"
+    dst = tirx.decl_buffer((4, 64), "float32", name="dst", scope=dst_scope)
+    src_region = _region(src, [rows, cols])
+    if case == "extra-empty-axis":
+        src = tirx.decl_buffer((4, 2, 64), "float32", name="src")
+        selector_extent = tirx.Select(tirx.Var("in_bounds", "bool"), 1, 0)
+        src_region = _region(src, [rows, selector_extent, cols])
+    annotations = {"emit_zero_burst": True}
+    if case == "padding":
+        annotations["data_select"] = 1
+    if case == "pad-value":
+        annotations["pad_value"] = 0
+    wrap = None
+    if case == "simtvf":
+        tx = tirx.IterVar(tvm.ir.Range(0, 32), tirx.Var("simtvf_thread", "int32"), tirx.IterVar.ThreadIndex, "threadIdx.x")
+        wrap = lambda body: tirx.AttrStmt(tx, "thread_extent", 32, body)  # noqa: E731
+    with pytest.raises(tvm.error.InternalError, match=diagnostic):
+        _lower(src, dst, src_region, _region(dst, [rows, cols]), annotations=annotations, wrap=wrap)
+
+
 def test_fixed_outer_axis_affects_the_pointer_but_not_the_l1_row_pitch():
     group = tirx.Var("group", "int32")
     src = tirx.decl_buffer((4, 16, 64), "bfloat16", name="src", strides=(2000, 80, 1))

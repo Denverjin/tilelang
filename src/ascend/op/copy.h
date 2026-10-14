@@ -33,6 +33,8 @@ public:
   int dual_dst_ctl{0}; // "dual_dst_ctl": L0C->UB dual-destination mode
   int transpose{0};    // "transpose": GM->L1 dn2nz / L1->L0 transpose request
   int data_select{0};  // "data_select": GM->UB hardware right-padding
+  // "emit_zero_burst": unguarded GM->UB row count.
+  bool emit_zero_burst{false};
   // Canonical allocation buffer selected from alloc_l0*_sf's IR binding.
   // Leading indices already include any materialized physical versions.
   Optional<Buffer> mx_sf_data;

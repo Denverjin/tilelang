@@ -262,6 +262,17 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
       return -1;
     };
     int64_t rb_plan = as_int_plan(plan_row_bytes);
+    if (op.emit_zero_burst) {
+      ICHECK_GT(rb_plan, 0)
+          << "Ascend T.copy emit_zero_burst requires a statically-known "
+             "positive DMA row byte length; use a strided 2D copy region.";
+      // Removing this guard must not discard another axis's OOB condition.
+      ICHECK(analyzer->CanProveEqual(
+          has_data, plan.n_rows > make_zero(plan.n_rows.dtype())))
+          << "Ascend T.copy emit_zero_burst requires the DMA row count to "
+             "represent every possibly-empty axis; another axis still "
+             "requires an empty-region guard.";
+    }
     bool data_select = dma_path == DMAPath::kGMToUB && op.data_select != 0;
     // Padding right-pads each row up to the next 32B boundary, so it needs a
     // statically-known row byte length to compute the pad count. A symbolic
@@ -732,7 +743,8 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
   }
 
   Stmt copy_stmt = Evaluate(call);
-  if (!is_one(has_data) && !analyzer->CanProve(has_data)) {
+  if (!op.emit_zero_burst && !is_one(has_data) &&
+      !analyzer->CanProve(has_data)) {
     copy_stmt = IfThenElse(has_data, copy_stmt);
   }
   return copy_stmt;
@@ -949,6 +961,11 @@ struct AscendCopyImpl {
 
   static Stmt Lower(const AscendCopyNode &op, const LowerArgs &T,
                     arith::Analyzer *analyzer) {
+    ICHECK(!op.emit_zero_burst ||
+           (GetDMAPath(op.src, op.dst) == DMAPath::kGMToUB &&
+            !IsInsideSimtVF(T) && !op.data_select && !op.pad_value.defined()))
+        << "Ascend T.copy emit_zero_burst requires unpadded GM->UB DMA "
+           "outside SimtVF.";
     ICHECK(!IsL0SFBuffer(op.src))
         << "L0 SF handles can only be read by gemm_blockscaled";
     if (IsL0SFBuffer(op.dst)) {
@@ -992,6 +1009,7 @@ void DecodeAscendCopyAnnotations(AscendCopyNode *node) {
   node->dual_dst_ctl = int_or("dual_dst_ctl", 0);
   node->transpose = int_or("transpose", 0);
   node->data_select = int_or("data_select", 0);
+  node->emit_zero_burst = int_or("emit_zero_burst", 0) != 0;
   node->mx_sf_data = std::nullopt;
   node->l2_cache_ctrl = std::nullopt;
   if (auto val = node->annotations.Get("l2_cache_ctrl")) {
