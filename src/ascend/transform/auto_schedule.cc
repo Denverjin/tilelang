@@ -104,32 +104,59 @@ uint16_t ManualRegisterPhaseMask(const std::vector<IRStructure *> &nodes,
   constexpr uint16_t kCubeModes =
       static_cast<uint16_t>(SpecialRegister::kHf32Mode) |
       static_cast<uint16_t>(SpecialRegister::kMmadDirection);
-  for (IRStructure *node : nodes) {
+  auto has_opaque_call = [](const ObjectRef &ir) {
+    bool opaque = false;
+    PostOrderVisit(ir, [&](const ObjectRef &object) {
+      if (const auto *call = object.as<CallNode>()) {
+        opaque |= !call->op.as<OpNode>() ||
+                  call->op.same_as(builtin::call_extern()) ||
+                  call->op.same_as(builtin::tvm_call_packed()) ||
+                  call->op.same_as(builtin::tvm_call_packed_lowered()) ||
+                  call->op.same_as(builtin::tvm_call_cpacked()) ||
+                  call->op.same_as(builtin::tvm_call_cpacked_lowered()) ||
+                  call->op.same_as(builtin::call_llvm_intrin());
+      }
+    });
+    return opaque;
+  };
+  auto has_unsafe_effect = [&](auto &&self, const IRStructure *node) -> bool {
     if (node->ContainsLoopBreak())
-      return 0;
-    std::vector<TaskNode *> tasks;
-    CollectAllTaskNodes(node, tasks);
-    for (const TaskNode *task : tasks) {
-      // PerCoreTask's aggregate write mask does not include configuration
-      // writes. Inspect its body before treating unrelated work as transparent.
-      if (task->IsPerCoreTask() &&
-          (AnalyzeSpecialRegisterWrites(task->stmt) & kCubeModes))
-        return 0;
-      bool opaque = false;
-      PostOrderVisit(task->stmt, [&](const ObjectRef &object) {
-        if (const auto *call = object.as<CallNode>()) {
-          opaque |= !call->op.as<OpNode>() ||
-                    call->op.same_as(builtin::call_extern()) ||
-                    call->op.same_as(builtin::tvm_call_packed()) ||
-                    call->op.same_as(builtin::tvm_call_packed_lowered()) ||
-                    call->op.same_as(builtin::tvm_call_cpacked()) ||
-                    call->op.same_as(builtin::tvm_call_cpacked_lowered()) ||
-                    call->op.same_as(builtin::call_llvm_intrin());
+      return true;
+    for (const auto &guard : node->GetGuards()) {
+      if (guard->IsCondition()) {
+        if (has_opaque_call(
+                static_cast<const ConditionGuard *>(guard.get())->condition))
+          return true;
+      } else {
+        const auto *attribute =
+            static_cast<const AttributeGuard *>(guard.get());
+        if (has_opaque_call(attribute->value))
+          return true;
+        if (const auto *expr = attribute->node.as<PrimExprNode>()) {
+          if (has_opaque_call(GetRef<PrimExpr>(expr)))
+            return true;
         }
-      });
-      if (opaque)
-        return 0;
+      }
     }
+    if (node->IsControl()) {
+      const auto *control = static_cast<const ControlNode *>(node);
+      // The header and guards can change modes even when the body only reads.
+      if (has_opaque_call(control->task->stmt))
+        return true;
+      return std::any_of(control->children.begin(), control->children.end(),
+                         [&](const std::shared_ptr<IRStructure> &child) {
+                           return self(self, child.get());
+                         });
+    }
+    const auto *task = static_cast<const TaskNode *>(node);
+    // PerCoreTask's aggregate write mask does not include configuration writes.
+    return has_opaque_call(task->stmt) ||
+           (task->IsPerCoreTask() &&
+            (AnalyzeSpecialRegisterWrites(task->stmt) & kCubeModes));
+  };
+  for (const IRStructure *node : nodes) {
+    if (has_unsafe_effect(has_unsafe_effect, node))
+      return 0;
   }
 
   uint16_t mask = 0;
@@ -145,13 +172,15 @@ uint16_t ManualRegisterPhaseMask(const std::vector<IRStructure *> &nodes,
       bool reads = (node->GetSpecialReadMask() & bit) != 0;
       if (!writes && !reads)
         continue;
-      if (!node->IsTask() || node->HasConditions() ||
-          static_cast<const TaskNode *>(node)->IsPerCoreTask()) {
+      if (node->HasConditions() ||
+          (node->IsTask() &&
+           static_cast<const TaskNode *>(node)->IsPerCoreTask())) {
         valid = false;
         break;
       }
       if (writes) {
-        if (!IsCubeConfiguration(static_cast<const TaskNode *>(node)->stmt) ||
+        if (!node->IsTask() ||
+            !IsCubeConfiguration(static_cast<const TaskNode *>(node)->stmt) ||
             (writer_stage >= 0 &&
              (stages[i] < writer_stage || stages[i] > first_stage + 1))) {
           valid = false;
@@ -161,6 +190,8 @@ uint16_t ManualRegisterPhaseMask(const std::vector<IRStructure *> &nodes,
           first_stage = stages[i];
         writer_stage = stages[i];
       }
+      // A loop that only reads this mode stays in its writer's region as one
+      // outer unit. Its inner stages and buffer versions do not change the mode.
       if (reads && (writer_stage < 0 || stages[i] != writer_stage)) {
         valid = false;
         break;

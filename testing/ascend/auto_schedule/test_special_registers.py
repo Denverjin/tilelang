@@ -183,7 +183,7 @@ def test_cube_mode_writers_follow_nested_gemm_core(mode):
     assert task_core_masks(after, setter) == {2}
 
 
-def _manual_cube_mode_loop(stages, mode, *, guarded_writer=False, mixed_modes=False, nested=None):
+def _manual_cube_mode_loop(stages, mode, *, guarded_writer=False, mixed_modes=False, nested=None, nested_readers=False, nested_effect=None):
     a = tirx.decl_buffer((16, 16), "float32", name="a", scope="shared.l0a")
     b = tirx.decl_buffer((16, 16), "float32", name="b", scope="shared.l0b")
     outputs = [tirx.decl_buffer((16, 16), "float32", name=f"c{i}", scope="shared.l0c") for i in range(2)]
@@ -203,8 +203,29 @@ def _manual_cube_mode_loop(stages, mode, *, guarded_writer=False, mixed_modes=Fa
         # HF32 has only its stage-4 writer, but its second reader is stage 5.
         # MMAD's two complete regions can use phases; HF32 must stay logical.
         operations[0] = seq(tirx.Evaluate(T.set_hf32_mode(None)), operations[0])
-    body = seq(
-        *(
+    units = []
+    for index, (op, stage) in enumerate(zip(operations, stages)):
+        if nested_readers and index % 2:
+            extent = 4
+            guard = None
+            if index == 1 and nested_effect == "opaque-header":
+                extent = tirx.call_extern("int32", "change_mode_and_return_count")
+            if index == 1 and nested_effect == "opaque-guard":
+                guard = tirx.call_extern("bool", "change_mode_and_return_condition")
+            inner_body = unit(op, core=0, stage=0, cost=(64, 32), guard=guard)
+            if index == 1 and nested_effect == "mode-writer":
+                inner_body = seq(unit(tirx.Evaluate(setters[0]), core=0, stage=0, cost=(1, 1)), inner_body)
+            inner = tirx.For(
+                tirx.Var(f"j{index}", "int32"),
+                0,
+                extent,
+                tirx.ForKind.SERIAL,
+                inner_body,
+                annotations={"num_stages": 2},
+            )
+            units.append(unit(inner, core=None, stage=stage))
+            continue
+        units.append(
             unit(
                 op,
                 core=0,
@@ -212,9 +233,8 @@ def _manual_cube_mode_loop(stages, mode, *, guarded_writer=False, mixed_modes=Fa
                 cost=(1, 1) if index % 2 == 0 else (64, 32),
                 guard=i == 0 if guarded_writer and index == 2 else None,
             )
-            for index, (op, stage) in enumerate(zip(operations, stages))
         )
-    )
+    body = seq(*units)
     if nested is not None:
         inner = tirx.For(tirx.Var("j", "int32"), 0, 2, tirx.ForKind.SERIAL, unit(tirx.Evaluate(nested), core=0, stage=0, cost=(1, 1)))
         body = seq(body, unit(inner, core=None, stage=stages[-1]))
@@ -233,6 +253,38 @@ def test_manual_cube_mode_regions_use_physical_order(mode, base_stage):
     assert [int(child.node["stage"]) for child in children] == stages
     for child, operation in zip(children, operations):
         tvm.ir.assert_structural_equal(child.body.body, operation)
+
+
+@pytest.mark.parametrize("mode", ["hf32", "mmad-direction"])
+def test_manual_cube_mode_regions_keep_nested_consumers(mode):
+    stages = [4, 4, 5, 5]
+    before, _ = _manual_cube_mode_loop(stages, mode, nested_readers=True)
+    phases = []
+    original = z3_scheduler.z3_schedule_loop_python
+
+    def capture(*args, **kwargs):
+        phases.append(kwargs["register_phase_deps"])
+        return original(*args, **kwargs)
+
+    with patch.object(z3_scheduler, "z3_schedule_loop_python", side_effect=capture):
+        after = transform.AutoSchedule()(before)
+    children = after["main"].body.block.body.body.body.seq
+    assert [int(child.node["stage"]) for child in children] == stages
+    for index in (1, 3):
+        inner = children[index].body
+        assert isinstance(inner, tirx.For)
+        assert int(inner.extent) == 4
+        assert len(calls(inner, "tl.tileop.gemm")) == 1
+    # The whole first loop must precede the next stage's configuration. At a
+    # tie reconstruction would emit the stage-5 setter before that loop.
+    assert (1, 2, 0, 1) in phases[-1]
+
+
+@pytest.mark.parametrize("effect", ["mode-writer", "opaque-header", "opaque-guard"])
+def test_manual_cube_mode_nested_consumers_reject_mode_changes(effect):
+    before, _ = _manual_cube_mode_loop([4, 4, 5, 5], "mmad-direction", nested_readers=True, nested_effect=effect)
+    with pytest.raises(RuntimeError, match="Manual schedule constraints are infeasible"):
+        transform.AutoSchedule()(before)
 
 
 @pytest.mark.parametrize(
