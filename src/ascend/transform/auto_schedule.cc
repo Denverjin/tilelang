@@ -61,6 +61,7 @@
 #include "./auto_schedule/scheduled_tir.h"
 #include "./auto_schedule/task_analysis.h"
 #include "./auto_schedule/task_annotations.h"
+#include "ascend/op/builtin.h"
 #include "ascend/op/copy.h"
 #include "ascend/op/utils.h"
 #include "ascend/transform/buffer_version.h"
@@ -79,6 +80,87 @@ using namespace tirx;
 using namespace ascend;
 
 namespace {
+
+bool IsCubeConfiguration(const Stmt &stmt) {
+  if (const auto *attr = stmt.as<AttrStmtNode>())
+    return IsCubeConfiguration(attr->body);
+  if (const auto *seq = stmt.as<SeqStmtNode>()) {
+    return std::all_of(seq->seq.begin(), seq->seq.end(), [](const Stmt &child) {
+      return IsCubeConfiguration(child);
+    });
+  }
+  const auto *evaluate = stmt.as<EvaluateNode>();
+  if (!evaluate)
+    return false;
+  const auto *call = evaluate->value.as<CallNode>();
+  return call && (call->op.same_as(tl::ascend_set_hf32_mode()) ||
+                  call->op.same_as(tl::ascend_set_mmad_direction()));
+}
+
+// A physical mode has no versions. Only move complete, unconditional config
+// regions from stage s to s+1; their source order also preserves the exit mode.
+uint16_t ManualRegisterPhaseMask(const std::vector<IRStructure *> &nodes,
+                                 const std::vector<int64_t> &stages) {
+  for (const IRStructure *node : nodes) {
+    if (!node->IsTask() || node->ContainsLoopBreak())
+      return 0;
+    const auto *task = static_cast<const TaskNode *>(node);
+    if (task->IsPerCoreTask())
+      return 0;
+    bool opaque = false;
+    PostOrderVisit(task->stmt, [&](const ObjectRef &object) {
+      if (const auto *call = object.as<CallNode>()) {
+        opaque |= !call->op.as<OpNode>() ||
+                  call->op.same_as(builtin::call_extern()) ||
+                  call->op.same_as(builtin::tvm_call_packed()) ||
+                  call->op.same_as(builtin::tvm_call_packed_lowered()) ||
+                  call->op.same_as(builtin::tvm_call_cpacked()) ||
+                  call->op.same_as(builtin::tvm_call_cpacked_lowered()) ||
+                  call->op.same_as(builtin::call_llvm_intrin());
+      }
+    });
+    if (opaque)
+      return 0;
+  }
+
+  uint16_t mask = 0;
+  for (SpecialRegister reg :
+       {SpecialRegister::kHf32Mode, SpecialRegister::kMmadDirection}) {
+    uint16_t bit = static_cast<uint16_t>(reg);
+    int64_t first_stage = -1;
+    int64_t writer_stage = -1;
+    bool valid = true;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      const IRStructure *node = nodes[i];
+      bool writes = (node->GetSpecialWriteMask() & bit) != 0;
+      bool reads = (node->GetSpecialReadMask() & bit) != 0;
+      if (!writes && !reads)
+        continue;
+      if (node->HasConditions()) {
+        valid = false;
+        break;
+      }
+      if (writes) {
+        if (!IsCubeConfiguration(static_cast<const TaskNode *>(node)->stmt) ||
+            (writer_stage >= 0 &&
+             (stages[i] < writer_stage || stages[i] > first_stage + 1))) {
+          valid = false;
+          break;
+        }
+        if (first_stage < 0)
+          first_stage = stages[i];
+        writer_stage = stages[i];
+      }
+      if (reads && (writer_stage < 0 || stages[i] != writer_stage)) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid && first_stage >= 0 && writer_stage == first_stage + 1)
+      mask |= bit;
+  }
+  return mask;
+}
 
 // AutoSchedule target resource limits.
 
@@ -786,6 +868,8 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   std::vector<int64_t> resource_flags;
   std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
       data_deps; // (i, j, distance, latency)
+  std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
+      register_phase_deps; // (i, j, physical wrap, latency)
   std::vector<std::pair<int64_t, int64_t>> resource_deps;
   std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
       owner_exclusion_deps;
@@ -952,35 +1036,48 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     }
   }
 
-  // Special-register ordering: a node writing register R must be ordered
-  // against every node reading R (RAW forward, WAR backward) and every other
-  // writer of R (WAW), preserving program order. loop_break writes
-  // kLoopControl, which every node reads, so it fences against all siblings;
-  // hf32/pad match only their consumers. The distance bit encodes intra-iter
-  // (0) vs next-iter (1) direction.
+  // Config regions in adjacent manual stages share one physical register.
+  // Keep logical dependencies for all other special state, including fences.
+  uint16_t phase_mask = manual_schedule && enable_offset
+                            ? ManualRegisterPhaseMask(nodes, manual_stages)
+                            : 0;
+  auto add_register_dep = [&](size_t u, size_t v, int wrap, int64_t latency,
+                              uint16_t registers) {
+    if (registers & ~phase_mask)
+      data_deps.emplace_back(u, v, wrap, latency);
+    if (registers & phase_mask) {
+      // Reconstruction issues larger stages first at equal physical times.
+      // A forward cross-stage WAR must therefore be strictly ordered.
+      if (wrap == 0 && manual_stages[u] < manual_stages[v])
+        latency = std::max<int64_t>(latency, 1);
+      register_phase_deps.emplace_back(u, v, wrap, latency);
+    }
+  };
   for (size_t i = 0; i < n; ++i) {
     uint16_t wmask = nodes[i]->GetSpecialWriteMask();
     if (wmask == 0)
       continue;
     for (size_t j = 0; j < n; ++j) {
-      if (j == i || (wmask & nodes[j]->GetSpecialReadMask()) == 0 ||
+      uint16_t overlap = wmask & nodes[j]->GetSpecialReadMask();
+      if (j == i || overlap == 0 ||
           (!(wmask & static_cast<uint16_t>(SpecialRegister::kLoopControl)) &&
            (NodeCoreMask(nodes[i]) & NodeCoreMask(nodes[j])) == 0))
         continue;
       if (i < j) {
-        data_deps.emplace_back(i, j, 0, latencies[i]);
-        data_deps.emplace_back(j, i, 1, 0);
+        add_register_dep(i, j, 0, latencies[i], overlap);
+        add_register_dep(j, i, 1, 0, overlap);
       } else {
-        data_deps.emplace_back(i, j, 1, latencies[i]);
-        data_deps.emplace_back(j, i, 0, 0);
+        add_register_dep(i, j, 1, latencies[i], overlap);
+        add_register_dep(j, i, 0, 0, overlap);
       }
     }
     for (size_t j = i + 1; j < n; ++j) {
-      if ((wmask & nodes[j]->GetSpecialWriteMask()) == 0 ||
+      uint16_t overlap = wmask & nodes[j]->GetSpecialWriteMask();
+      if (overlap == 0 ||
           (NodeCoreMask(nodes[i]) & NodeCoreMask(nodes[j])) == 0)
         continue;
-      data_deps.emplace_back(i, j, 0, latencies[i]);
-      data_deps.emplace_back(j, i, 1, latencies[j]);
+      add_register_dep(i, j, 0, latencies[i], overlap);
+      add_register_dep(j, i, 1, latencies[j], overlap);
     }
   }
 
@@ -1092,6 +1189,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   ffi::Array<ffi::Array<int64_t>> tvm_pipe_order_deps;
   ffi::Array<int64_t> tvm_storage_sizes;
   ffi::Array<int64_t> tvm_manual_stages;
+  ffi::Array<ffi::Array<int64_t>> tvm_register_phase_deps;
+  for (const auto &[u, v, wrap, latency] : register_phase_deps)
+    tvm_register_phase_deps.push_back({u, v, wrap, latency});
 
   for (auto val : latencies) {
     tvm_latencies.push_back(val);
@@ -1165,7 +1265,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
                    tvm_data_deps, tvm_resource_deps, tvm_owner_exclusion_deps,
                    tvm_pipe_order_deps, tvm_storage_sizes, tvm_memory_groups,
                    tvm_stage_order_deps, enable_offset, tvm_manual_stages,
-                   manual_schedule)
+                   manual_schedule, tvm_register_phase_deps)
           .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
 
   ffi::Array<int64_t> start_times = return_val.get<0>();

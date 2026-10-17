@@ -181,3 +181,91 @@ def test_cube_mode_writers_follow_nested_gemm_core(mode):
     after = transform.ResolveCore()(before)
     assert len(calls(after, setter)) == 2
     assert task_core_masks(after, setter) == {2}
+
+
+def _manual_cube_mode_loop(stages, mode, *, guarded_writer=False, mixed_modes=False):
+    a = tirx.decl_buffer((16, 16), "float32", name="a", scope="shared.l0a")
+    b = tirx.decl_buffer((16, 16), "float32", name="b", scope="shared.l0b")
+    outputs = [tirx.decl_buffer((16, 16), "float32", name=f"c{i}", scope="shared.l0c") for i in range(2)]
+    setters = (
+        [T.set_hf32_mode("nearest_even"), T.set_hf32_mode(None)]
+        if mode == "hf32"
+        else [T.set_mmad_direction("m"), T.set_mmad_direction("n")]
+    )
+    i = tirx.Var("i", "int32")
+    operations = [
+        tirx.Evaluate(setters[0]),
+        tirx.Evaluate(T.gemm(a, b, outputs[0], transpose_B=True, clear_accum=True)),
+        tirx.Evaluate(setters[1]),
+        tirx.Evaluate(T.gemm(a, b, outputs[1], transpose_B=True, clear_accum=True)),
+    ]
+    if mixed_modes:
+        # HF32 has only its stage-4 writer, but its second reader is stage 5.
+        # MMAD's two complete regions can use phases; HF32 must stay logical.
+        operations[0] = seq(tirx.Evaluate(T.set_hf32_mode(None)), operations[0])
+    body = seq(
+        *(
+            unit(
+                op,
+                core=0,
+                stage=stage,
+                cost=(1, 1) if index % 2 == 0 else (64, 32),
+                guard=i == 0 if guarded_writer and index == 2 else None,
+            )
+            for index, (op, stage) in enumerate(zip(operations, stages))
+        )
+    )
+    loop = tirx.For(i, 0, 3, tirx.ForKind.SERIAL, body, annotations={"enable_offset": True})
+    return kernel(unit(loop, core=None, stage=-1), buffers=[a, b, *outputs]), operations
+
+
+@pytest.mark.parametrize("mode", ["hf32", "mmad-direction"])
+@pytest.mark.parametrize("base_stage", [0, 4, 12])
+def test_manual_cube_mode_regions_use_physical_order(mode, base_stage):
+    stages = [base_stage, base_stage, base_stage + 1, base_stage + 1]
+    before, operations = _manual_cube_mode_loop(stages, mode)
+    # Use the real solver: fixed logical 0/1 WAW distances make this infeasible.
+    after = transform.AutoSchedule()(before)
+    children = after["main"].body.block.body.body.body.seq
+    assert [int(child.node["stage"]) for child in children] == stages
+    for child, operation in zip(children, operations):
+        tvm.ir.assert_structural_equal(child.body.body, operation)
+
+
+@pytest.mark.parametrize(
+    "stages, guarded_writer",
+    [
+        pytest.param([5, 5, 4, 4], False, id="exit-mode"),
+        pytest.param([4, 5, 5, 5], False, id="reader-crosses-stage"),
+        pytest.param([4, 4, 5, 5], True, id="conditional-writer"),
+        pytest.param([4, 4, 6, 6], False, id="nonadjacent-stages"),
+    ],
+)
+def test_manual_cube_mode_unsafe_regions_keep_logical_dependencies(stages, guarded_writer):
+    before, _ = _manual_cube_mode_loop(stages, "mmad-direction", guarded_writer=guarded_writer)
+    with pytest.raises(RuntimeError, match="Manual schedule constraints are infeasible"):
+        transform.AutoSchedule()(before)
+
+
+def test_manual_cube_modes_preserve_other_register_dependencies():
+    before, _ = _manual_cube_mode_loop([4, 4, 5, 5], "mmad-direction", mixed_modes=True)
+    inputs = []
+    original = z3_scheduler.z3_schedule_loop_python
+
+    def capture(*args, **kwargs):
+        inputs.append((args[4], kwargs["register_phase_deps"]))
+        return original(*args, **kwargs)
+
+    with (
+        patch.object(z3_scheduler, "z3_schedule_loop_python", side_effect=capture),
+        pytest.raises(RuntimeError, match="Manual schedule constraints are infeasible"),
+    ):
+        transform.AutoSchedule()(before)
+    assert len(inputs) == 1
+    logical, physical = inputs[0]
+    # The same writer/reader pair must retain HF32's logical dependency as
+    # well as MMAD's physical dependency; classifying whole pairs loses one.
+    assert (0, 3, 0, 1) in logical
+    assert (0, 3, 0, 1) in physical
+    # At equal phases the stage-5 setter would precede the stage-4 GEMM.
+    assert (1, 2, 0, 1) in physical

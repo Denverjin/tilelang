@@ -145,6 +145,12 @@ def Stage(stage: int):
     ``T.Pipelined(..., num_stages=...)`` controls the automatic buffer-version
     search bound; it does not limit the values accepted by ``T.Stage``.
 
+    Unconditional HF32/MMAD configuration regions in adjacent stages may share
+    the physical register in source issue order. Each consumer must use its
+    preceding setter's stage, and writer stages must not decrease. This keeps
+    both consumer modes and the loop's outgoing mode unchanged. Nested or
+    conditional configuration regions retain logical iteration dependencies.
+
     Example
     -------
     >>> for i in T.Pipelined(8, annotations={"enable_offset": True}):
