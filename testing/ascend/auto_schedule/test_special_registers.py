@@ -183,7 +183,7 @@ def test_cube_mode_writers_follow_nested_gemm_core(mode):
     assert task_core_masks(after, setter) == {2}
 
 
-def _manual_cube_mode_loop(stages, mode, *, guarded_writer=False, mixed_modes=False):
+def _manual_cube_mode_loop(stages, mode, *, guarded_writer=False, mixed_modes=False, nested=None):
     a = tirx.decl_buffer((16, 16), "float32", name="a", scope="shared.l0a")
     b = tirx.decl_buffer((16, 16), "float32", name="b", scope="shared.l0b")
     outputs = [tirx.decl_buffer((16, 16), "float32", name=f"c{i}", scope="shared.l0c") for i in range(2)]
@@ -215,6 +215,9 @@ def _manual_cube_mode_loop(stages, mode, *, guarded_writer=False, mixed_modes=Fa
             for index, (op, stage) in enumerate(zip(operations, stages))
         )
     )
+    if nested is not None:
+        inner = tirx.For(tirx.Var("j", "int32"), 0, 2, tirx.ForKind.SERIAL, unit(tirx.Evaluate(nested), core=0, stage=0, cost=(1, 1)))
+        body = seq(body, unit(inner, core=None, stage=stages[-1]))
     loop = tirx.For(i, 0, 3, tirx.ForKind.SERIAL, body, annotations={"enable_offset": True})
     return kernel(unit(loop, core=None, stage=-1), buffers=[a, b, *outputs]), operations
 
@@ -269,3 +272,19 @@ def test_manual_cube_modes_preserve_other_register_dependencies():
     assert (0, 3, 0, 1) in physical
     # At equal phases the stage-5 setter would precede the stage-4 GEMM.
     assert (1, 2, 0, 1) in physical
+
+
+@pytest.mark.parametrize("nested", ["unrelated", "mode-writer", "opaque"])
+def test_manual_cube_mode_regions_inspect_nested_effects(nested):
+    operation = {
+        "unrelated": T.set_atomic_none(),
+        "mode-writer": T.set_mmad_direction("m"),
+        "opaque": tirx.call_extern("int32", "custom_stateful_call"),
+    }[nested]
+    before, _ = _manual_cube_mode_loop([4, 4, 5, 5], "mmad-direction", nested=operation)
+    if nested == "unrelated":
+        after = transform.AutoSchedule()(before)
+        assert len(calls(after, "tl.ascend_set_mmad_direction")) == 2
+    else:
+        with pytest.raises(RuntimeError, match="Manual schedule constraints are infeasible"):
+            transform.AutoSchedule()(before)
