@@ -598,6 +598,54 @@ def test_address_backed_l0_view_remaps_partial_copy_origin(major_mn, pitch, offs
     assert re.search(r"__cb__ bfloat16_t \*dst =", source), source
 
 
+@pytest.mark.parametrize(
+    "storage_dtype,view_dtype,view_cols",
+    [("float32", "bfloat16", 256), ("bfloat16", "float32", 64), ("float32", "float32", 64)],
+    ids=["narrow", "widen", "same-width-reshape"],
+)
+@pytest.mark.parametrize("prefix", [0, 64])
+@pytest.mark.parametrize("row,col", [(0, 0), (1, 16)])
+def test_dma_reinterpreted_view_prefix_uses_pointer_element_units(storage_dtype, view_dtype, view_cols, prefix, row, col):
+    """Both DMA directions must agree with the view's byte address."""
+    import tilelang
+
+    storage_bytes = tvm.DataType(storage_dtype).bits // 8
+    view_bytes = tvm.DataType(view_dtype).bits // 8
+    view_rows = 512 * storage_bytes // (view_cols * view_bytes)
+
+    @T.prim_func
+    def main(A: T.Tensor((2, 32), view_dtype), O: T.Tensor((2, 32), view_dtype)):
+        with T.Kernel(1):
+            storage = T.alloc_shared((4, 128), storage_dtype)
+            view = T.view(storage, shape=(view_rows, view_cols), dtype=view_dtype)
+            T.annotate_layout({storage: tilelang.layout.Layout((4, 128), lambda r, c: r * 128 + c + prefix)})
+            with T.Vector():
+                T.copy(A, view[row : row + 2, col : col + 32])
+                T.copy(view[row : row + 2, col : col + 32], O)
+
+    captured = []
+
+    @tvm.instrument.pass_instrument
+    class Capture:
+        def run_after_pass(self, mod, info):
+            if info.name == "tl.AscendLowerTileOp":
+                captured.append(mod)
+
+    with tvm.transform.PassContext(config={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False}, instruments=[Capture()]):
+        tilelang.lower(main, target="ascend")
+
+    assert len(captured) == 1
+    (load,) = calls(captured[0], "tl.ascend_copy_gm_to_ubuf")
+    (store,) = calls(captured[0], "tl.ascend_copy_ubuf_to_gm")
+    # This byte address comes directly from the storage prefix and the view's
+    # row/column coordinates, independently of the layout reshape machinery.
+    expected_bytes = prefix * storage_bytes + (row * view_cols + col) * view_bytes
+    for ptr in (load.args[0], store.args[1]):
+        assert ptr.op.name == "tirx.tvm_access_ptr"
+        assert ptr.args[0].dtype == view_dtype
+        _equal([ptr.args[2] * view_bytes], [expected_bytes])
+
+
 @pytest.mark.parametrize("normalize", [False, True])
 def test_sf_tail_source_fits_its_fractal_allocation(normalize):
     src = tirx.decl_buffer((24, 4), "uint8", name="src", scope="shared.l1")

@@ -594,12 +594,33 @@ private:
       // Get original and new buffer shapes.
       Array<PrimExpr> old_shape = original_buffer->shape;
       Array<PrimExpr> new_shape = new_buffer->shape;
+      Layout access_layout = layout;
+      DataType access_dtype = access_ptr_call->args[0].dtype();
+      int buffer_bits =
+          original_buffer->dtype.bits() * original_buffer->dtype.lanes();
+      int access_bits = access_dtype.bits() * access_dtype.lanes();
+      if (access_bits != buffer_bits) {
+        // A raw access pointer retains its element type but not its Buffer
+        // identity. Its offset is in that type's elements, even when the data
+        // Var resolves to a differently typed allocation. Reinterpret the
+        // logical layout before mapping the offset, preserving sub-element
+        // lanes and expressing the physical result in the pointer's units.
+        PrimExpr elements = Integer(1);
+        for (const PrimExpr &extent : old_shape) {
+          elements *= extent;
+        }
+        old_shape = {analyzer_->Simplify(
+            floordiv(elements * Integer(buffer_bits), Integer(access_bits)))};
+        access_layout = layout->Reshape(
+            old_shape, analyzer_, Integer(buffer_bits), Integer(access_bits));
+        new_shape = access_layout->OutputShape();
+      }
       Array<PrimExpr> zero_indices;
       for (size_t i = 0; i < old_shape.size(); ++i) {
         zero_indices.push_back(make_zero(elem_offset.dtype()));
       }
       Array<PrimExpr> forward_indices = RemapAccessIndices(
-          zero_indices, old_shape, new_shape, layout, elem_offset);
+          zero_indices, old_shape, new_shape, access_layout, elem_offset);
       PrimExpr new_offset = 0;
       PrimExpr stride_offset = 1;
       for (int i = static_cast<int>(new_shape.size()) - 1; i >= 0; --i) {
