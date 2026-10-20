@@ -332,7 +332,11 @@ permission is pairwise, with no transitive closure. The region, `level`, and
 `cross` qualifiers continue to govern dependency matching; reuse permission is
 for the storage pair. The caller must cover all accesses affected by reuse.
 Allocation scope, alignment, and the shared-memory-reuse disable option still
-apply. Buffer identities, layouts, and version counters remain independent.
+apply. Buffer identities and layouts remain independent. An isolated,
+equal-sized L0B pair with matching fixed automatic version counts can share a
+ring clock when a whole-buffer hint uses the default iteration matching and all
+accesses belong to disjoint automatic owners. Explicit iteration indexing, manual
+versions, strides, and offsets keep the ordinary dependency path.
 
 ## Trace the complete storage protocol
 

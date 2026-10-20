@@ -1222,7 +1222,7 @@ tvm::transform::Pass PrepareMultiBuffer() {
             ICHECK_NE(task->GetCoreMask(), kCoreUnassigned)
                 << "PrepareMultiBuffer requires AssignCore to run first";
           }
-          L0StorageGroups groups(CollectL0SFBindings(context.root));
+          L0StorageGroups groups = CollectL0StorageGroups(context.root);
           auto &metadata = scheduled_tir.metadata;
           metadata.buffer_versions = ExpandL0StorageGroupValues(
               metadata.buffer_versions, groups, "version counts");

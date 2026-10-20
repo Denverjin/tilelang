@@ -260,7 +260,11 @@ def assume_conflict(a, b=None, *, level=None, cross=None, group=None):
     permission applies to the whole storage pair. The caller must ensure that
     the declared dependencies cover every access affected by that reuse.
     Existing allocation scope, alignment, and reuse-disable rules still apply.
-    This does not merge buffer identities, layouts, or version counters.
+    Buffer identities and layouts remain separate. For an isolated, equal-sized
+    L0B pair with the same fixed automatic version count, a whole-buffer hint
+    with the default iteration matching can also select one shared ring clock.
+    All accesses must belong to disjoint automatic owners; explicit iteration indexing,
+    manual versions, strides, or offsets retain the ordinary dependency path.
 
     Args:
         a: first region -- ``buffer[indices...]`` or a bare ``buffer`` (the

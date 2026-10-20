@@ -429,8 +429,12 @@ private:
       ICHECK_EQ(hint.size(), 4U);
       if (!hint[3].cast<Bool>()->value)
         continue;
-      Var lhs = groups_.Representative(storage(hint[0]));
-      Var rhs = groups_.Representative(storage(hint[1]));
+      Var lhs = storage(hint[0]);
+      Var rhs = storage(hint[1]);
+      if (!groups_.SharesReuseRing(lhs, rhs)) {
+        lhs = groups_.Representative(lhs);
+        rhs = groups_.Representative(rhs);
+      }
       // A positive hint explicitly permits storage reuse. Its region and
       // iteration qualifiers still control dependency analysis independently.
       if (!lhs.same_as(rhs))

@@ -808,7 +808,7 @@ tvm::transform::Pass AnnotateMultiBufferEligible() {
         [](const TilelangKernelContext &context) {
           ScheduledTIR scheduled_tir =
               DecodeScheduledTIR(context.root, context.outer_ctx);
-          L0StorageGroups groups(CollectL0SFBindings(context.root));
+          L0StorageGroups groups = CollectL0StorageGroups(context.root);
           auto &metadata = scheduled_tir.metadata;
           metadata.buffer_versions = ExpandL0StorageGroupValues(
               metadata.buffer_versions, groups, "version counts");

@@ -106,7 +106,8 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes,
                     const BufferVersionMap &manual_buffer_versions = {},
                     const MultiBufferOwnerMap &multi_buffer_owners = {},
                     DependencyCache *dependency_cache = nullptr,
-                    const ConflictHintList &root_conflicts = {});
+                    const ConflictHintList &root_conflicts = {},
+                    const L0StorageGroups &storage_groups = L0StorageGroups());
 
 // Check whether two task regions may overlap under their respective symbolic
 // contexts. Only a proof of disjointness removes a conflict.
@@ -128,7 +129,8 @@ bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
                         size_t num_storage_owners = 0,
                         const ConflictHintList &root_conflicts = {},
                         Optional<PrimExpr> a_pitch = std::nullopt,
-                        Optional<PrimExpr> b_pitch = std::nullopt);
+                        Optional<PrimExpr> b_pitch = std::nullopt,
+                        bool shared_reuse_ring = false);
 
 } // namespace ascend
 } // namespace tl

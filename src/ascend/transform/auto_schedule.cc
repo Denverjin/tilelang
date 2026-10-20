@@ -40,6 +40,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/container/array.h>
+#include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/function.h>
@@ -65,6 +66,7 @@
 #include "ascend/op/utils.h"
 #include "ascend/transform/buffer_version.h"
 #include "backend/common/target_utils.h"
+#include "layout/layout.h"
 #include "op/utils.h"
 #include "runtime/thread_storage_scope.h"
 #include "support/check.h"
@@ -583,7 +585,7 @@ std::vector<std::shared_ptr<IRStructure>> ScheduleBuilder::Z3SchedulePython(
     // Buffer-region data dependencies
     auto deps = AnalyzeDependencies(
         nodes, /*loop=*/nullptr, manual_buffer_versions_, multi_buffer_owners_,
-        &dependency_cache_, root_conflict_hints_);
+        &dependency_cache_, root_conflict_hints_, storage_groups_);
     std::unordered_map<IRStructure *, size_t> node_idx;
     for (size_t i = 0; i < n; ++i) {
       node_idx[nodes[i]] = i;
@@ -987,7 +989,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   // Buffer-region data dependencies
   auto deps = AnalyzeDependencies(nodes, ctrl, manual_buffer_versions_,
                                   multi_buffer_owners_, &dependency_cache_,
-                                  root_conflict_hints_);
+                                  root_conflict_hints_, storage_groups_);
   std::unordered_map<IRStructure *, size_t> node_idx;
   for (size_t i = 0; i < n; ++i) {
     node_idx[nodes[i]] = i;
@@ -1351,6 +1353,171 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
 
 // Pass orchestration.
 
+// Select an isolated, equal-sized L0B pair whose complete automatic epochs
+// can use one ring clock. Other conflict hints retain their dependency-only
+// interpretation during scheduling. In particular, do not take a transitive
+// closure of pairwise reuse permissions.
+static void PlanExplicitL0BReuseRing(ScheduledTIR *scheduled_tir) {
+  auto &metadata = scheduled_tir->metadata;
+  if (metadata.root_conflict_hints.empty() ||
+      metadata.kernel_root->annotations.count(kReuseRingBindings))
+    return;
+
+  class L0BCollector : public StmtExprVisitor {
+  public:
+    std::vector<Buffer> buffers;
+
+  private:
+    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> seen;
+    void Record(const Buffer &buffer) {
+      if (IsL0BBuffer(buffer) && seen.insert(buffer->data).second)
+        buffers.push_back(buffer);
+    }
+    void VisitStmt_(const SBlockNode *op) final {
+      for (const Buffer &buffer : op->alloc_buffers)
+        Record(buffer);
+      StmtExprVisitor::VisitStmt_(op);
+    }
+    void VisitStmt_(const AllocBufferNode *op) final { Record(op->buffer); }
+  } collector;
+  collector(metadata.kernel_root);
+  if (collector.buffers.size() != 2)
+    return;
+  const Buffer &a = collector.buffers[0];
+  const Buffer &b = collector.buffers[1];
+  if (a->dtype != b->dtype || !a->strides.empty() || !b->strides.empty() ||
+      !is_zero(a->elem_offset) || !is_zero(b->elem_offset))
+    return;
+  auto a_versions = metadata.buffer_versions.Get(a->data);
+  auto b_versions = metadata.buffer_versions.Get(b->data);
+  if (!a_versions.has_value() || !b_versions.has_value() ||
+      a_versions.value() <= 1 || a_versions.value() != b_versions.value() ||
+      metadata.manual_buffer_versions.count(a->data) ||
+      metadata.manual_buffer_versions.count(b->data))
+    return;
+  for (const Var &storage : {a->data, b->data}) {
+    if (auto mode = metadata.buffer_version_modes.Get(storage)) {
+      if (mode.value() == "iteration")
+        return;
+    }
+  }
+
+  bool declared = false;
+  for (const ffi::Any &entry : metadata.root_conflict_hints) {
+    auto hint = entry.cast<Array<ffi::Any>>();
+    if (!hint[3].cast<Bool>()->value || hint[2].cast<IntImm>()->value != -1)
+      continue;
+    auto lhs = hint[0].as<Var>();
+    auto rhs = hint[1].as<Var>();
+    if (lhs.has_value() && rhs.has_value() &&
+        ((lhs.value().same_as(a->data) && rhs.value().same_as(b->data)) ||
+         (lhs.value().same_as(b->data) && rhs.value().same_as(a->data))))
+      declared = true;
+  }
+  if (!declared)
+    return;
+
+  Map<Buffer, Layout> layouts;
+  if (auto value =
+          metadata.kernel_root->annotations.Get(tvm::tl::attr::kLayoutMap))
+    layouts = value.value().cast<Map<Buffer, Layout>>();
+  auto storage_bytes = [&](const Buffer &buffer) -> int64_t {
+    Array<PrimExpr> shape = buffer->shape;
+    bool has_layout = false;
+    bool found_layout = false;
+    for (const auto &[candidate, layout] : layouts) {
+      if (candidate->data.same_as(buffer->data)) {
+        has_layout = true;
+        if (candidate->dtype == buffer->dtype && candidate->strides.empty() &&
+            is_zero(candidate->elem_offset) &&
+            ffi::StructuralEqual()(candidate->shape, buffer->shape)) {
+          shape = layout->OutputShape();
+          found_layout = true;
+          break;
+        }
+      }
+    }
+    if (has_layout && !found_layout)
+      return 0;
+    PrimExpr bits =
+        IntImm(DataType::Int(64), buffer->dtype.bits() * buffer->dtype.lanes());
+    for (const PrimExpr &extent : shape)
+      bits *= extent;
+    arith::Analyzer analyzer;
+    PrimExpr bytes = analyzer.Simplify(floordiv(bits + 7, 8));
+    const auto *value = bytes.as<IntImmNode>();
+    return value != nullptr ? value->value : 0;
+  };
+  int64_t bytes = storage_bytes(a);
+  if (bytes <= 0 || bytes != storage_bytes(b))
+    return;
+
+  L0StorageGroups existing = CollectL0StorageGroups(metadata.kernel_root);
+  if (existing.Members(a->data).size() != 1 ||
+      existing.Members(b->data).size() != 1)
+    return;
+  MultiBufferOwnerMap owners =
+      CollectMultiBufferOwners(scheduled_tir->tree, existing);
+  auto a_owners = owners.find(a->data);
+  auto b_owners = owners.find(b->data);
+  if (a_owners == owners.end() || b_owners == owners.end())
+    return;
+  for (ControlNode *a_owner : a_owners->second) {
+    for (ControlNode *b_owner : b_owners->second) {
+      if (a_owner == b_owner || a_owner->IsWithin(b_owner) ||
+          b_owner->IsWithin(a_owner))
+        return;
+    }
+  }
+  std::vector<TaskNode *> tasks;
+  CollectAllTaskNodes(scheduled_tir->tree, tasks);
+  for (const Var &storage : {a->data, b->data}) {
+    auto found = owners.find(storage);
+    if (found == owners.end() || found->second.empty())
+      return;
+    for (TaskNode *task : tasks) {
+      auto touches = [&](const auto &regions) {
+        return std::any_of(regions.begin(), regions.end(),
+                           [&](const BufferRegion &region) {
+                             return region->buffer->data.same_as(storage);
+                           });
+      };
+      if (!touches(task->GetReadRegions()) && !touches(task->GetWriteRegions()))
+        continue;
+      if (std::count_if(
+              found->second.begin(), found->second.end(),
+              [&](ControlNode *owner) { return task->IsWithin(owner); }) != 1)
+        return;
+    }
+  }
+
+  ReuseRingBindings bindings{{b->data, a->data}};
+  metadata.kernel_root.CopyOnWrite()->annotations.Set(kReuseRingBindings,
+                                                      bindings);
+  L0StorageGroups groups = CollectL0StorageGroups(metadata.kernel_root);
+  std::function<void(IRStructure *)> expand = [&](IRStructure *node) {
+    if (!node->IsControl())
+      return;
+    auto *control = static_cast<ControlNode *>(node);
+    if (auto value = control->control->annotations.Get(kMultiBufferEligible)) {
+      Array<Var> eligible;
+      std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> seen;
+      for (const Var &storage : value.value().cast<Array<Var>>()) {
+        for (const Var &member : groups.Members(storage)) {
+          if (seen.insert(member).second)
+            eligible.push_back(member);
+        }
+      }
+      control->control.CopyOnWrite()->annotations.Set(kMultiBufferEligible,
+                                                      eligible);
+    }
+    for (const auto &child : control->children)
+      expand(child.get());
+  };
+  for (const auto &node : scheduled_tir->tree)
+    expand(node.get());
+}
+
 static void WarnOnUnappliedBufferVersionOverrides(
     const BufferVersionMap &buffer_version_overrides,
     const BufferVersionMap &selected_buffer_versions) {
@@ -1386,7 +1553,8 @@ static void ScheduleSingleKernel(const Stmt &kernel_body, Target target,
 
   // Schedule IRStructure in place with the Z3 scheduler.
   ScheduleBuilder unit_builder;
-  L0StorageGroups groups(CollectL0SFBindings(metadata.kernel_root));
+  PlanExplicitL0BReuseRing(scheduled_tir);
+  L0StorageGroups groups = CollectL0StorageGroups(metadata.kernel_root);
   metadata.buffer_versions = ExpandL0StorageGroupValues(
       metadata.buffer_versions, groups, "version counts");
   metadata.manual_buffer_versions = ExpandL0StorageGroupValues(
