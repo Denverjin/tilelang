@@ -244,7 +244,7 @@ def assume_no_conflict(a, b=None, *, level=None, cross=None, group=None):
 
 
 def assume_conflict(a, b=None, *, level=None, cross=None, group=None):
-    """Assert that two buffer regions conflict for dependency analysis.
+    """Assert a dependency conflict and permit the two storages to be reused.
 
     This is the conservative counterpart of :func:`assume_no_conflict`.  It
     makes the auto-scheduler treat matching accesses as if they used the same
@@ -252,6 +252,15 @@ def assume_conflict(a, b=None, *, level=None, cross=None, group=None):
     disjoint.  The usual RAW, WAR, and WAW rules still apply: two read-only
     accesses do not form a dependency.  The marker is consumed before
     auto-scheduling and is a runtime no-op.
+
+    A positive hint also explicitly permits physical reuse of the two backing
+    storages, including when lifetime inference cannot establish that reuse.
+    The permission is pairwise and does not imply transitive compatibility.
+    Region, ``level``, and ``cross`` restrict the dependency matching; the reuse
+    permission applies to the whole storage pair. The caller must ensure that
+    the declared dependencies cover every access affected by that reuse.
+    Existing allocation scope, alignment, and reuse-disable rules still apply.
+    This does not merge buffer identities, layouts, or version counters.
 
     Args:
         a: first region -- ``buffer[indices...]`` or a bare ``buffer`` (the

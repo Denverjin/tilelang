@@ -1,11 +1,87 @@
 """The reuse contract survives scheduled lowering and is consumed by packing."""
 
+import pytest
 import tilelang
 import tilelang.ascend.language as T
 from tilelang import tvm
 from tvm import tirx
-from testing.ascend._ir import nodes
+from testing.ascend._ir import calls, nodes
 from testing.ascend.auto_schedule._reuse_utils import _make_cyclic_scalar_program
+
+
+@pytest.mark.parametrize("disable_reuse", [False, True])
+def test_conflict_hint_reuses_independent_l0_layouts(disable_reuse):
+    @T.prim_func
+    def main(
+        Q: T.Tensor((64, 128), "bfloat16"),
+        K: T.Tensor((64, 128), "bfloat16"),
+        CQ: T.Tensor((64, 64), "float32"),
+        CV: T.Tensor((64, 128), "float32"),
+    ):
+        with T.Kernel(1):
+            q = T.alloc_l1((64, 128), "bfloat16")
+            k0 = T.alloc_l1((32, 128), "bfloat16")
+            k1 = T.alloc_l1((32, 128), "bfloat16")
+            aq = T.alloc_l0a((64, 128), "bfloat16")
+            av = T.alloc_l0a((64, 64), "bfloat16")
+            bq = T.alloc_l0b((64, 128), "bfloat16")
+            bv = T.alloc_l0b((64, 128), "bfloat16")
+            cq = T.alloc_l0c((64, 64), "float32")
+            cv = T.alloc_l0c((64, 128), "float32")
+            T.annotate_buffer_versions({q: 1, k0: 1, k1: 1, aq: 2, av: 1, bq: 4, bv: 4, cq: 1, cv: 1})
+            T.assume_conflict(bq, bv, level=-1, cross=False)
+            T.copy(Q, q)
+            T.copy(K[:32, :], k0)
+            T.copy(K[32:, :], k1)
+            T.set_mmad_direction("m")
+            for _d in T.Pipelined(4, num_stages=4):
+                with T.Stage(0):
+                    T.copy(q, aq)
+                    with T.Task():
+                        T.copy(k0, bq[:32, :], l0_pitch=4)
+                        T.copy(k1, bq[32:, :], l0_pitch=4)
+                    T.gemm(aq, bq, cq, transpose_B=True, clear_accum=True)
+            T.copy(cq, CQ)
+            T.copy(q[:, :64], av)
+            T.set_mmad_direction("n")
+            for _d in T.Pipelined(4, num_stages=4):
+                with T.Stage(0):
+                    with T.Task():
+                        T.copy(k0, bv[:32, :], l0_pitch=8)
+                        T.copy(k1, bv[32:, :], l0_pitch=8)
+                    T.gemm(av, bv, cv, clear_accum=True)
+            T.copy(cv, CV)
+
+    snapshots = {}
+
+    @tvm.instrument.pass_instrument
+    class Capture:
+        def run_after_pass(self, mod, info):
+            if info.name in ("tl.AscendLowerTileOp", "tl.MergeUBAllocations"):
+                snapshots[info.name] = mod
+
+    with (
+        tvm.target.Target("ascend"),
+        tvm.transform.PassContext(config={"tl.disable_shared_memory_reuse": disable_reuse}, instruments=[Capture()]),
+    ):
+        tilelang.lower(main, target="ascend", enable_device_compile=False)
+    (allocation,) = [
+        node.buffer
+        for func in snapshots["tl.MergeUBAllocations"].functions.values()
+        for node in nodes(func, tirx.AllocBuffer)
+        if node.buffer.scope() in ("shared.l0b", "shared.l0b.dyn")
+    ]
+    allocated_bytes = int(allocation.shape[0]) * tvm.DataType(allocation.dtype).bits // 8
+    assert allocated_bytes == (131072 if disable_reuse else 65536)
+
+    offsets = {0: [], 1: []}
+    analyzer = tvm.arith.Analyzer()
+    for call in calls(snapshots["tl.AscendLowerTileOp"], "tl.ascend_load_cbuf_to_cb"):
+        pointer = call.args[0]
+        assert pointer.op.name == "tirx.tvm_access_ptr"
+        offsets[int(call.args[-1])].append(int(analyzer.simplify(pointer.args[2] % 8192)))
+    assert sorted(offsets[0]) == [0, 512]
+    assert sorted(offsets[1]) == [0, 4096]
 
 
 def test_alias_contract_lifetime():

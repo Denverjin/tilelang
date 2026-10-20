@@ -326,6 +326,14 @@ to be treated as conflicting while retaining the usual RAW/WAR/WAW rules;
 read-only pairs still have no dependency. If contradictory hints match, conflict
 wins. See `tilelang/ascend/language/schedule_hint.py` for the API.
 
+A positive conflict hint also explicitly permits the two backing storages to
+reuse memory, even when lifetime inference cannot prove that reuse. This
+permission is pairwise, with no transitive closure. The region, `level`, and
+`cross` qualifiers continue to govern dependency matching; reuse permission is
+for the storage pair. The caller must cover all accesses affected by reuse.
+Allocation scope, alignment, and the shared-memory-reuse disable option still
+apply. Buffer identities, layouts, and version counters remain independent.
+
 ## Trace the complete storage protocol
 
 For a suspicious access or wait, build a table with:

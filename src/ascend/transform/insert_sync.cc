@@ -831,7 +831,7 @@ public:
 
     BufferAliasAnalyzer buffer_alias_analyzer(*this, storage_groups_);
     buffer_alias_analyzer.Collect(root);
-    buffer_alias_analyzer.Analyze(root);
+    buffer_alias_analyzer.Analyze(root, root_conflicts_);
     buffer_alias_analyzer.Validate();
     buffer_aliases_ = buffer_alias_analyzer.GetAliases();
   }
