@@ -149,10 +149,12 @@ def Stage(stage: int):
     share one physical state across stages. Reads retain their reaching write
     in logical stage order (source order within a stage), and must precede the
     next physical overwrite, at most one pipeline round away. Independent
-    generations can therefore use nonadjacent stages. Read-modify-write updates
-    retain their value dependencies. Control and pipe fences remain logical;
-    unresolved conditional writes, opaque effects, and cross-stage scalar
-    snapshots retain conservative dependencies.
+    generations can therefore use nonadjacent stages. Reads and writes within
+    one task are summarized without ordering, so even a read after a local
+    write conservatively retains its incoming-value dependency.
+    Control and pipe fences remain logical; unresolved conditional writes,
+    opaque effects, and cross-stage scalar snapshots retain conservative
+    dependencies.
 
     Example
     -------

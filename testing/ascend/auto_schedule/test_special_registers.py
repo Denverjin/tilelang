@@ -413,18 +413,25 @@ def test_manual_scalar_recurrence_keeps_its_update_chain():
         tvm.ir.assert_structural_equal(child.body.body, operation)
 
 
-def test_manual_scalar_task_kills_its_incoming_value():
-    before, operations = _scalar_state_loop([0, 0, 3, 3])
+@pytest.mark.parametrize("second_stage", [0, 3])
+def test_manual_scalar_task_keeps_conservative_read_dependencies(second_stage):
+    before, operations = _scalar_state_loop([0, 0, second_stage, second_stage])
     loop = before["main"].body.block.body.body
     grouped = seq(
         unit(seq(*operations[:2]), core=1, stage=0, cost=(2, 2)),
-        unit(seq(*operations[2:]), core=1, stage=3, cost=(2, 2)),
+        unit(seq(*operations[2:]), core=1, stage=second_stage, cost=(2, 2)),
     )
     loop = tirx.For(loop.loop_var, loop.min, loop.extent, loop.kind, grouped, annotations=loop.annotations)
     block = before["main"].body.block
     before = kernel(unit(loop, core=None, stage=-1), buffers=list(block.alloc_buffers), params=list(before["main"].buffer_map.values()))
+    # Whole-task access summaries retain each read even after a local write.
+    # The resulting update chain cannot span nonadjacent physical rounds.
+    if second_stage == 3:
+        with pytest.raises(RuntimeError, match="Manual schedule constraints are infeasible"):
+            transform.AutoSchedule()(before)
+        return
     after = transform.AutoSchedule()(before)
     children = after["main"].body.block.body.body.body.seq
-    assert [int(child.node["stage"]) for child in children] == [0, 3]
+    assert [int(child.node["stage"]) for child in children] == [0, second_stage]
     for child, expected in zip(children, [seq(*operations[:2]), seq(*operations[2:])]):
         tvm.ir.assert_structural_equal(child.body.body, expected)

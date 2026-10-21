@@ -57,6 +57,7 @@
 #include "./auto_schedule/dependency_analysis.h"
 #include "./auto_schedule/ir_structure.h"
 #include "./auto_schedule/kernel_rewriter.h"
+#include "./auto_schedule/memory_detector.h"
 #include "./auto_schedule/multi_buffer.h"
 #include "./auto_schedule/scheduled_tir.h"
 #include "./auto_schedule/task_analysis.h"
@@ -94,14 +95,6 @@ struct SingleState {
   uint16_t reg{0};
   Optional<Var> storage;
 
-  bool Reads(const IRStructure *node) const {
-    return storage.defined() ? node->ReadsStorage(storage.value())
-                             : (node->GetSpecialReadMask() & reg) != 0;
-  }
-  bool Writes(const IRStructure *node) const {
-    return storage.defined() ? node->WritesStorage(storage.value())
-                             : (node->GetSpecialWriteMask() & reg) != 0;
-  }
   bool MustWrite(const Stmt &stmt) const {
     if (const auto *attr = stmt.as<AttrStmtNode>())
       return MustWrite(attr->body);
@@ -126,78 +119,11 @@ struct SingleState {
 };
 
 struct StateAccess {
-  // Reads of the incoming value, before a guaranteed write in this unit.
+  // Task reads conservatively consume the incoming value, even if the task
+  // also writes it. Control nodes compose their children in logical order.
   bool reads{false};
   bool writes{false};
   bool must_write{false};
-};
-
-// Task-local scalar assignments can kill earlier values before a later read.
-// Summarize those effects in execution order, including branch intersections.
-class ScalarStateAccessAnalyzer : public StmtExprVisitor {
-public:
-  explicit ScalarStateAccessAnalyzer(Var storage)
-      : storage_(std::move(storage)) {}
-
-  StateAccess Analyze(const Stmt &stmt) {
-    VisitStmt(stmt);
-    return access_;
-  }
-
-private:
-  Var storage_;
-  StateAccess access_;
-
-  void VisitExpr_(const BufferLoadNode *op) final {
-    if (op->buffer->data.same_as(storage_))
-      access_.reads |= !access_.must_write;
-    StmtExprVisitor::VisitExpr_(op);
-  }
-  void VisitExpr_(const VarNode *op) final {
-    // An address passed to an intrinsic can read the incoming scalar too.
-    if (GetRef<Var>(op).same_as(storage_))
-      access_.reads |= !access_.must_write;
-  }
-  void VisitStmt_(const BufferStoreNode *op) final {
-    VisitExpr(op->value);
-    for (const PrimExpr &index : op->indices)
-      VisitExpr(index);
-    if (op->predicate.defined())
-      VisitExpr(op->predicate.value());
-    if (op->buffer->data.same_as(storage_)) {
-      access_.writes = true;
-      access_.must_write |=
-          !op->predicate.defined() || is_one(op->predicate.value());
-    }
-  }
-  void VisitStmt_(const IfThenElseNode *op) final {
-    VisitExpr(op->condition);
-    bool incoming = access_.must_write;
-    VisitStmt(op->then_case);
-    bool then_written = access_.must_write;
-    access_.must_write = incoming;
-    if (op->else_case.defined())
-      VisitStmt(op->else_case.value());
-    access_.must_write &= then_written;
-  }
-  void VisitStmt_(const ForNode *op) final {
-    VisitExpr(op->min);
-    VisitExpr(op->extent);
-    bool incoming = access_.must_write;
-    VisitStmt(op->body);
-    const auto *extent = op->extent.as<IntImmNode>();
-    access_.must_write =
-        incoming || (extent && extent->value > 0 && access_.must_write);
-  }
-  void VisitStmt_(const SBlockRealizeNode *op) final {
-    for (const PrimExpr &value : op->iter_values)
-      VisitExpr(value);
-    VisitExpr(op->predicate);
-    bool incoming = access_.must_write;
-    VisitStmt(op->block);
-    access_.must_write =
-        incoming || (is_one(op->predicate) && access_.must_write);
-  }
 };
 
 CoreMask NodeCoreMask(const IRStructure *node);
@@ -210,11 +136,25 @@ StateAccess SummarizeState(const IRStructure *node, const SingleState &state,
   if (node->IsTask()) {
     const auto *task = static_cast<const TaskNode *>(node);
     if (state.storage.defined()) {
-      result =
-          ScalarStateAccessAnalyzer(state.storage.value()).Analyze(task->stmt);
-      result.writes |= state.Writes(node);
+      MemoryAccessDetector detector(
+          MemoryAccessDetector::AccessMode::kPhysical);
+      detector.Analyze(task->stmt);
+      auto touches = [&](const std::vector<BufferRegion> &regions) {
+        return std::any_of(
+            regions.begin(), regions.end(), [&](const BufferRegion &region) {
+              return region->buffer->data.same_as(state.storage.value());
+            });
+      };
+      result = {touches(detector.GetReadRegions()),
+                touches(detector.GetWriteRegions()),
+                touches(detector.GetMustWriteRegions())};
+      for (const Var &storage : detector.GetOpaqueAccessVars()) {
+        if (storage.same_as(state.storage.value()))
+          result = {true, true, false};
+      }
     } else {
-      result = {state.Reads(node), state.Writes(node),
+      result = {(node->GetSpecialReadMask() & state.reg) != 0,
+                (node->GetSpecialWriteMask() & state.reg) != 0,
                 state.MustWrite(task->stmt)};
     }
   } else {
