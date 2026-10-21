@@ -1101,7 +1101,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     for (size_t j = 0; j < n; ++j) {
       uint16_t overlap = wmask & nodes[j]->GetSpecialReadMask();
       if (j == i || overlap == 0 ||
-          (!(wmask & static_cast<uint16_t>(SpecialRegister::kLoopControl)) &&
+          (!(overlap & static_cast<uint16_t>(SpecialRegister::kLoopControl)) &&
            (NodeCoreMask(nodes[i]) & NodeCoreMask(nodes[j])) == 0))
         continue;
       if (i < j) {
