@@ -81,127 +81,277 @@ using namespace ascend;
 
 namespace {
 
-bool IsCubeConfiguration(const Stmt &stmt) {
-  if (const auto *attr = stmt.as<AttrStmtNode>())
-    return IsCubeConfiguration(attr->body);
-  if (const auto *seq = stmt.as<SeqStmtNode>()) {
-    return std::all_of(seq->seq.begin(), seq->seq.end(), [](const Stmt &child) {
-      return IsCubeConfiguration(child);
-    });
+// Configuration values are state; loop-control and pipe registers are fences.
+constexpr uint16_t kConfigurationRegisters =
+    static_cast<uint16_t>(SpecialRegister::kHf32Mode) |
+    static_cast<uint16_t>(SpecialRegister::kMmadDirection) |
+    static_cast<uint16_t>(SpecialRegister::kPadValue) |
+    static_cast<uint16_t>(SpecialRegister::kAtomicMode);
+
+using PhaseDependency = std::tuple<int64_t, int64_t, int64_t, int64_t>;
+
+struct SingleState {
+  uint16_t reg{0};
+  Optional<Var> storage;
+
+  bool Reads(const IRStructure *node) const {
+    return storage.defined() ? node->ReadsStorage(storage.value())
+                             : (node->GetSpecialReadMask() & reg) != 0;
   }
-  const auto *evaluate = stmt.as<EvaluateNode>();
-  if (!evaluate)
-    return false;
-  const auto *call = evaluate->value.as<CallNode>();
-  return call && (call->op.same_as(tl::ascend_set_hf32_mode()) ||
-                  call->op.same_as(tl::ascend_set_mmad_direction()));
+  bool Writes(const IRStructure *node) const {
+    return storage.defined() ? node->WritesStorage(storage.value())
+                             : (node->GetSpecialWriteMask() & reg) != 0;
+  }
+  bool MustWrite(const Stmt &stmt) const {
+    if (const auto *attr = stmt.as<AttrStmtNode>())
+      return MustWrite(attr->body);
+    if (const auto *seq = stmt.as<SeqStmtNode>())
+      return std::any_of(seq->seq.begin(), seq->seq.end(),
+                         [&](const Stmt &child) { return MustWrite(child); });
+    if (const auto *branch = stmt.as<IfThenElseNode>())
+      return branch->else_case.defined() && MustWrite(branch->then_case) &&
+             MustWrite(branch->else_case.value());
+    const auto *evaluate = stmt.as<EvaluateNode>();
+    const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+    if (!call || !(AnalyzeSpecialRegisterWrites(stmt) & reg))
+      return false;
+    // A write nested in an argument (for example if_then_else) need not
+    // execute. Only the call's own configuration effect is a definite kill.
+    for (const PrimExpr &arg : call->args) {
+      if (AnalyzeSpecialRegisterWrites(Evaluate(arg)) & reg)
+        return false;
+    }
+    return true;
+  }
+};
+
+struct StateAccess {
+  // Reads of the incoming value, before a guaranteed write in this unit.
+  bool reads{false};
+  bool writes{false};
+  bool must_write{false};
+};
+
+// Task-local scalar assignments can kill earlier values before a later read.
+// Summarize those effects in execution order, including branch intersections.
+class ScalarStateAccessAnalyzer : public StmtExprVisitor {
+public:
+  explicit ScalarStateAccessAnalyzer(Var storage)
+      : storage_(std::move(storage)) {}
+
+  StateAccess Analyze(const Stmt &stmt) {
+    VisitStmt(stmt);
+    return access_;
+  }
+
+private:
+  Var storage_;
+  StateAccess access_;
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    if (op->buffer->data.same_as(storage_))
+      access_.reads |= !access_.must_write;
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const VarNode *op) final {
+    // An address passed to an intrinsic can read the incoming scalar too.
+    if (GetRef<Var>(op).same_as(storage_))
+      access_.reads |= !access_.must_write;
+  }
+  void VisitStmt_(const BufferStoreNode *op) final {
+    VisitExpr(op->value);
+    for (const PrimExpr &index : op->indices)
+      VisitExpr(index);
+    if (op->predicate.defined())
+      VisitExpr(op->predicate.value());
+    if (op->buffer->data.same_as(storage_)) {
+      access_.writes = true;
+      access_.must_write |=
+          !op->predicate.defined() || is_one(op->predicate.value());
+    }
+  }
+  void VisitStmt_(const IfThenElseNode *op) final {
+    VisitExpr(op->condition);
+    bool incoming = access_.must_write;
+    VisitStmt(op->then_case);
+    bool then_written = access_.must_write;
+    access_.must_write = incoming;
+    if (op->else_case.defined())
+      VisitStmt(op->else_case.value());
+    access_.must_write &= then_written;
+  }
+  void VisitStmt_(const ForNode *op) final {
+    VisitExpr(op->min);
+    VisitExpr(op->extent);
+    bool incoming = access_.must_write;
+    VisitStmt(op->body);
+    const auto *extent = op->extent.as<IntImmNode>();
+    access_.must_write =
+        incoming || (extent && extent->value > 0 && access_.must_write);
+  }
+  void VisitStmt_(const SBlockRealizeNode *op) final {
+    for (const PrimExpr &value : op->iter_values)
+      VisitExpr(value);
+    VisitExpr(op->predicate);
+    bool incoming = access_.must_write;
+    VisitStmt(op->block);
+    access_.must_write =
+        incoming || (is_one(op->predicate) && access_.must_write);
+  }
+};
+
+CoreMask NodeCoreMask(const IRStructure *node);
+
+StateAccess SummarizeState(const IRStructure *node, const SingleState &state,
+                           CoreMask core) {
+  StateAccess result;
+  if (!(NodeCoreMask(node) & core))
+    return result;
+  if (node->IsTask()) {
+    const auto *task = static_cast<const TaskNode *>(node);
+    if (state.storage.defined()) {
+      result =
+          ScalarStateAccessAnalyzer(state.storage.value()).Analyze(task->stmt);
+      result.writes |= state.Writes(node);
+    } else {
+      result = {state.Reads(node), state.Writes(node),
+                state.MustWrite(task->stmt)};
+    }
+  } else {
+    const auto *control = static_cast<const ControlNode *>(node);
+    result = SummarizeState(control->task.get(), state, core);
+    std::vector<IRStructure *> children;
+    for (const auto &child : control->children)
+      children.push_back(child.get());
+    // Match buffer dependency analysis: stages establish logical iteration
+    // order; the sibling list establishes physical per-pipe issue order.
+    std::stable_sort(children.begin(), children.end(),
+                     [](const IRStructure *a, const IRStructure *b) {
+                       return a->GetStage() < b->GetStage();
+                     });
+    for (const IRStructure *child : children) {
+      StateAccess access = SummarizeState(child, state, core);
+      result.reads |= access.reads && !result.must_write;
+      result.writes |= access.writes;
+      result.must_write |= access.must_write;
+    }
+    const auto *extent = control->control->extent.as<IntImmNode>();
+    result.must_write &= extent && extent->value > 0;
+  }
+  if (state.storage.defined())
+    result.reads |= node->GuardsTouchStorage(state.storage.value());
+  result.must_write &= !node->HasConditions();
+  return result;
 }
 
-// A physical mode has no versions. Only move complete, unconditional config
-// regions from stage s to s+1; their source order also preserves the exit mode.
-uint16_t ManualRegisterPhaseMask(const std::vector<IRStructure *> &nodes,
-                                 const std::vector<int64_t> &stages) {
-  constexpr uint16_t kCubeModes =
-      static_cast<uint16_t>(SpecialRegister::kHf32Mode) |
-      static_cast<uint16_t>(SpecialRegister::kMmadDirection);
-  auto has_opaque_call = [](const ObjectRef &ir) {
-    bool opaque = false;
+bool HasUnknownStateEffects(const IRStructure *node) {
+  auto opaque = [](const ObjectRef &ir) {
+    bool found = false;
     PostOrderVisit(ir, [&](const ObjectRef &object) {
       if (const auto *call = object.as<CallNode>()) {
-        opaque |= !call->op.as<OpNode>() ||
-                  call->op.same_as(builtin::call_extern()) ||
-                  call->op.same_as(builtin::tvm_call_packed()) ||
-                  call->op.same_as(builtin::tvm_call_packed_lowered()) ||
-                  call->op.same_as(builtin::tvm_call_cpacked()) ||
-                  call->op.same_as(builtin::tvm_call_cpacked_lowered()) ||
-                  call->op.same_as(builtin::call_llvm_intrin());
+        found |= !call->op.as<OpNode>() ||
+                 call->op.same_as(builtin::call_extern()) ||
+                 call->op.same_as(builtin::tvm_call_packed()) ||
+                 call->op.same_as(builtin::tvm_call_packed_lowered()) ||
+                 call->op.same_as(builtin::tvm_call_cpacked()) ||
+                 call->op.same_as(builtin::tvm_call_cpacked_lowered()) ||
+                 call->op.same_as(builtin::call_llvm_intrin());
       }
     });
-    return opaque;
+    return found;
   };
-  auto has_unsafe_effect = [&](auto &&self, const IRStructure *node) -> bool {
-    if (node->ContainsLoopBreak())
-      return true;
-    for (const auto &guard : node->GetGuards()) {
-      if (guard->IsCondition()) {
-        if (has_opaque_call(
-                static_cast<const ConditionGuard *>(guard.get())->condition))
-          return true;
-      } else {
-        const auto *attribute =
-            static_cast<const AttributeGuard *>(guard.get());
-        if (has_opaque_call(attribute->value))
-          return true;
-        if (const auto *expr = attribute->node.as<PrimExprNode>()) {
-          if (has_opaque_call(GetRef<PrimExpr>(expr)))
-            return true;
-        }
-      }
-    }
-    if (node->IsControl()) {
-      const auto *control = static_cast<const ControlNode *>(node);
-      // The header and guards can change modes even when the body only reads.
-      if (has_opaque_call(control->task->stmt))
+  if (node->ContainsLoopBreak())
+    return true;
+  for (const auto &guard : node->GetGuards()) {
+    if (guard->IsCondition()) {
+      if (opaque(static_cast<const ConditionGuard *>(guard.get())->condition))
         return true;
-      return std::any_of(control->children.begin(), control->children.end(),
-                         [&](const std::shared_ptr<IRStructure> &child) {
-                           return self(self, child.get());
-                         });
+    } else {
+      const auto *attr = static_cast<const AttributeGuard *>(guard.get());
+      if (opaque(attr->value))
+        return true;
+      if (const auto *expr = attr->node.as<PrimExprNode>()) {
+        if (opaque(GetRef<PrimExpr>(expr)))
+          return true;
+      }
     }
+  }
+  if (node->IsTask()) {
     const auto *task = static_cast<const TaskNode *>(node);
-    // PerCoreTask's aggregate write mask does not include configuration writes.
-    return has_opaque_call(task->stmt) ||
-           (task->IsPerCoreTask() &&
-            (AnalyzeSpecialRegisterWrites(task->stmt) & kCubeModes));
-  };
-  for (const IRStructure *node : nodes) {
-    if (has_unsafe_effect(has_unsafe_effect, node))
-      return 0;
+    // PerCoreTask does not expose all internal configuration effects.
+    return task->IsPerCoreTask() || opaque(task->stmt);
   }
+  const auto *control = static_cast<const ControlNode *>(node);
+  return opaque(control->task->stmt) ||
+         std::any_of(control->children.begin(), control->children.end(),
+                     [](const auto &child) {
+                       return HasUnknownStateEffects(child.get());
+                     });
+}
 
-  uint16_t mask = 0;
-  for (SpecialRegister reg :
-       {SpecialRegister::kHf32Mode, SpecialRegister::kMmadDirection}) {
-    uint16_t bit = static_cast<uint16_t>(reg);
-    int64_t first_stage = -1;
-    int64_t writer_stage = -1;
-    bool valid = true;
-    for (size_t i = 0; i < nodes.size(); ++i) {
-      const IRStructure *node = nodes[i];
-      bool writes = (node->GetSpecialWriteMask() & bit) != 0;
-      bool reads = (node->GetSpecialReadMask() & bit) != 0;
-      if (!writes && !reads)
-        continue;
-      if (node->HasConditions() ||
-          (node->IsTask() &&
-           static_cast<const TaskNode *>(node)->IsPerCoreTask())) {
-        valid = false;
-        break;
-      }
-      if (writes) {
-        if (!node->IsTask() ||
-            !IsCubeConfiguration(static_cast<const TaskNode *>(node)->stmt) ||
-            (writer_stage >= 0 &&
-             (stages[i] < writer_stage || stages[i] > first_stage + 1))) {
-          valid = false;
-          break;
-        }
-        if (first_stage < 0)
-          first_stage = stages[i];
-        writer_stage = stages[i];
-      }
-      // A loop that only reads this mode stays in its writer's region as one
-      // outer unit. Its inner stages and buffer versions do not change the
-      // mode.
-      if (reads && (writer_stage < 0 || stages[i] != writer_stage)) {
-        valid = false;
-        break;
-      }
+// Bind each read to its reaching definition in logical stage order, then
+// protect that generation until the next physical overwrite. A single state
+// has no ring of versions: each value must be consumed within one physical II.
+// Unlike all-pairs logical WAW edges, these edges allow independent generations
+// to interleave across any number of stages without changing their readers.
+bool AddSingleStateDependencies(const std::vector<StateAccess> &accesses,
+                                const std::vector<int64_t> &stages,
+                                const std::vector<int64_t> &latencies,
+                                std::vector<PhaseDependency> *deps) {
+  std::vector<size_t> writers, logical;
+  for (size_t i = 0; i < accesses.size(); ++i) {
+    if (accesses[i].writes) {
+      // A conditional kill may leave an older generation live. Retain the
+      // conservative logical dependencies until that reaching definition is
+      // known, rather than assuming that the skipped writer reset the state.
+      if (!accesses[i].must_write)
+        return false;
+      writers.push_back(i);
     }
-    if (valid && first_stage >= 0 && writer_stage == first_stage + 1)
-      mask |= bit;
+    logical.push_back(i);
   }
-  return mask;
+  if (writers.empty())
+    return false;
+  std::stable_sort(logical.begin(), logical.end(),
+                   [&](size_t a, size_t b) { return stages[a] < stages[b]; });
+  auto add = [&](size_t u, size_t v, int64_t wrap, int64_t gap) {
+    ICHECK(wrap == 0 || wrap == 1)
+        << "Manual schedule constraints are infeasible: a single-state read "
+           "would cross a physical overwrite; check T.Stage values";
+    // Reconstruction sorts equal phases by descending stage, then source
+    // position. Preserve a required edge when that tie order would reverse it.
+    if (wrap == 0 &&
+        (stages[u] < stages[v] || (stages[u] == stages[v] && u > v)))
+      gap = std::max<int64_t>(gap, 1);
+    deps->emplace_back(u, v, wrap, gap);
+  };
+  std::vector<size_t> next_writer(accesses.size());
+  for (size_t k = 0; k < writers.size(); ++k) {
+    size_t u = writers[k], v = writers[(k + 1) % writers.size()];
+    next_writer[u] = v;
+    add(u, v, v <= u ? 1 : 0, latencies[u]);
+  }
+  // The first read may consume the previous logical iteration's last write.
+  size_t writer = writers.front();
+  for (size_t i : logical) {
+    if (accesses[i].writes)
+      writer = i;
+  }
+  int64_t distance = 1;
+  for (size_t reader : logical) {
+    if (accesses[reader].reads) {
+      int64_t wrap = distance + stages[reader] - stages[writer];
+      size_t overwrite = next_writer[writer];
+      int64_t overwrite_wrap = overwrite <= writer ? 1 : 0;
+      add(writer, reader, wrap, latencies[writer]);
+      add(reader, overwrite, overwrite_wrap - wrap, 0);
+    }
+    if (accesses[reader].writes) {
+      writer = reader;
+      distance = 0;
+    }
+  }
+  return true;
 }
 
 // AutoSchedule target resource limits.
@@ -911,7 +1061,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
       data_deps; // (i, j, distance, latency)
   std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
-      register_phase_deps; // (i, j, physical wrap, latency)
+      state_phase_deps; // (i, j, physical wrap, latency)
   std::vector<std::pair<int64_t, int64_t>> resource_deps;
   std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
       owner_exclusion_deps;
@@ -1078,22 +1228,83 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     }
   }
 
-  // Config regions in adjacent manual stages share one physical register.
-  // Keep logical dependencies for all other special state, including fences.
-  uint16_t phase_mask = manual_schedule && enable_offset
-                            ? ManualRegisterPhaseMask(nodes, manual_stages)
-                            : 0;
+  uint16_t phase_mask = 0;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> phase_storages;
+  if (manual_schedule && enable_offset &&
+      !std::any_of(nodes.begin(), nodes.end(), HasUnknownStateEffects)) {
+    auto add_state = [&](const SingleState &state) {
+      std::vector<PhaseDependency> state_deps;
+      bool has_writer = false;
+      for (CoreMask core : kConcreteCores) {
+        std::vector<StateAccess> accesses(n);
+        bool core_has_writer = false;
+        for (size_t i = 0; i < n; ++i) {
+          if (NodeCoreMask(nodes[i]) & core)
+            accesses[i] = SummarizeState(nodes[i], state, core);
+          core_has_writer |= accesses[i].writes;
+        }
+        if (!core_has_writer)
+          continue;
+        has_writer = true;
+        if (!AddSingleStateDependencies(accesses, manual_stages, latencies,
+                                        &state_deps))
+          return false;
+      }
+      state_phase_deps.insert(state_phase_deps.end(), state_deps.begin(),
+                              state_deps.end());
+      return has_writer;
+    };
+    for (uint16_t bit = 1; bit != 0; bit <<= 1) {
+      if ((kConfigurationRegisters & bit) && add_state({bit, std::nullopt}))
+        phase_mask |= bit;
+    }
+    std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual>
+        scalar_storages;
+    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> non_scalar_storages;
+    for (const IRStructure *node : nodes) {
+      auto regions = node->GetWriteRegions();
+      auto reads = node->GetReadRegions();
+      regions.insert(regions.end(), reads.begin(), reads.end());
+      for (const auto &region : regions) {
+        const Buffer &buffer = region->buffer;
+        if (buffer.scope() == "local.var" && buffer->shape.size() == 1 &&
+            is_one(buffer->shape[0])) {
+          auto [it, inserted] = scalar_storages.emplace(buffer->data, buffer);
+          if (!inserted && !it->second.same_as(buffer))
+            non_scalar_storages.insert(buffer->data);
+        } else {
+          non_scalar_storages.insert(buffer->data);
+        }
+      }
+    }
+    LetDependencyClosure let_closure = CollectLetDependencyClosure_(nodes);
+    for (const auto &entry : scalar_storages) {
+      const Var &storage = entry.first;
+      // Explicit rings and aliased views keep buffer-region semantics: a
+      // differently typed or offset alias may write only part of a value.
+      if (non_scalar_storages.count(storage) ||
+          manual_buffer_versions_.count(storage) ||
+          buffer_version_overrides_.count(storage) ||
+          ctrl->IsMultiBufferEligible(storage))
+        continue;
+      // Cross-stage Bind copies re-read storage in their consumer's stage.
+      // Keep the existing snapshot constraints until those copies have their
+      // own explicit reaching-definition identity.
+      bool copied_read = false;
+      for (size_t u = 0; u < n; ++u) {
+        for (size_t l : let_closure.dependencies[u])
+          copied_read |= manual_stages[u] != manual_stages[l] &&
+                         nodes[l]->ReadsStorage(storage);
+      }
+      if (!copied_read && add_state({0, storage}))
+        phase_storages.insert(storage);
+    }
+  }
   auto add_register_dep = [&](size_t u, size_t v, int wrap, int64_t latency,
                               uint16_t registers) {
+    // Fences and state with unresolved reaching definitions remain logical.
     if (registers & ~phase_mask)
       data_deps.emplace_back(u, v, wrap, latency);
-    if (registers & phase_mask) {
-      // Reconstruction issues larger stages first at equal physical times.
-      // A forward cross-stage WAR must therefore be strictly ordered.
-      if (wrap == 0 && manual_stages[u] < manual_stages[v])
-        latency = std::max<int64_t>(latency, 1);
-      register_phase_deps.emplace_back(u, v, wrap, latency);
-    }
   };
   for (size_t i = 0; i < n; ++i) {
     uint16_t wmask = nodes[i]->GetSpecialWriteMask();
@@ -1132,6 +1343,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     node_idx[nodes[i]] = i;
   }
   for (const auto &dep : deps) {
+    if (dep.kind == DependencyKind::kData && dep.storage.defined() &&
+        phase_storages.count(dep.storage.value()))
+      continue;
     size_t i = node_idx[dep.prod_node];
     size_t j = node_idx[dep.cons_node];
     int64_t latency = GetDependencyLatency(dep);
@@ -1231,9 +1445,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   ffi::Array<ffi::Array<int64_t>> tvm_pipe_order_deps;
   ffi::Array<int64_t> tvm_storage_sizes;
   ffi::Array<int64_t> tvm_manual_stages;
-  ffi::Array<ffi::Array<int64_t>> tvm_register_phase_deps;
-  for (const auto &[u, v, wrap, latency] : register_phase_deps)
-    tvm_register_phase_deps.push_back({u, v, wrap, latency});
+  ffi::Array<ffi::Array<int64_t>> tvm_state_phase_deps;
+  for (const auto &[u, v, wrap, latency] : state_phase_deps)
+    tvm_state_phase_deps.push_back({u, v, wrap, latency});
 
   for (auto val : latencies) {
     tvm_latencies.push_back(val);
@@ -1307,7 +1521,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
                    tvm_data_deps, tvm_resource_deps, tvm_owner_exclusion_deps,
                    tvm_pipe_order_deps, tvm_storage_sizes, tvm_memory_groups,
                    tvm_stage_order_deps, enable_offset, tvm_manual_stages,
-                   manual_schedule, tvm_register_phase_deps)
+                   manual_schedule, tvm_state_phase_deps)
           .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
 
   ffi::Array<int64_t> start_times = return_val.get<0>();

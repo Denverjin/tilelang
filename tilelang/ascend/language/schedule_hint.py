@@ -145,11 +145,14 @@ def Stage(stage: int):
     ``T.Pipelined(..., num_stages=...)`` controls the automatic buffer-version
     search bound; it does not limit the values accepted by ``T.Stage``.
 
-    Unconditional HF32/MMAD configuration regions in adjacent stages may share
-    the physical register in source issue order. Each consumer must use its
-    preceding setter's stage, and writer stages must not decrease. This keeps
-    both consumer modes and the loop's outgoing mode unchanged. Nested or
-    conditional configuration regions retain logical iteration dependencies.
+    Single-element ``local.var`` buffers and hardware configuration registers
+    share one physical state across stages. Reads retain their reaching write
+    in logical stage order (source order within a stage), and must precede the
+    next physical overwrite, at most one pipeline round away. Independent
+    generations can therefore use nonadjacent stages. Read-modify-write updates
+    retain their value dependencies. Control and pipe fences remain logical;
+    unresolved conditional writes, opaque effects, and cross-stage scalar
+    snapshots retain conservative dependencies.
 
     Example
     -------

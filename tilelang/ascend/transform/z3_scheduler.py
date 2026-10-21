@@ -283,7 +283,7 @@ def z3_schedule_loop_python(
     manual_schedule: bool = False,
     seed: int | None = 42,
     verbose: bool = False,
-    register_phase_deps: list[tuple[int, int, int, int]] | None = None,
+    state_phase_deps: list[tuple[int, int, int, int]] | None = None,
 ) -> tuple[list[int], list[int], int]:
     """Schedule a loop body with modulo, stage, and storage constraints.
 
@@ -341,10 +341,11 @@ def z3_schedule_loop_python(
     verbose : bool
         Print solver inputs, search progress, and the selected schedule.
 
-    register_phase_deps : list[tuple[int, int, int, int]] | None
-        Manual configuration ordering (u, v, physical_wrap, gap), requiring
-        r[v] + physical_wrap * II >= r[u] + gap. These do not carry buffer
-        versions or logical iteration distances.
+    state_phase_deps : list[tuple[int, int, int, int]] | None
+        Single-state value/overwrite ordering (u, v, physical_wrap, gap),
+        requiring r[v] + physical_wrap * II >= r[u] + gap. Reaching writes
+        have already been matched and logical distances converted to a
+        physical wrap of zero or one; these states have no buffer versions.
 
     Returns
     -------
@@ -375,14 +376,14 @@ def z3_schedule_loop_python(
         if not enable_offset and any(stage != 0 for stage in manual_stages):
             raise ValueError("Non-zero manual stages require enable_offset=True")
 
-    if register_phase_deps is None:
-        register_phase_deps = []
-    if register_phase_deps:
+    if state_phase_deps is None:
+        state_phase_deps = []
+    if state_phase_deps:
         if not manual_schedule or not enable_offset:
-            raise ValueError("Register phase dependencies require a manual offset schedule")
-        for u, v, wrap, gap in register_phase_deps:
+            raise ValueError("State phase dependencies require a manual offset schedule")
+        for u, v, wrap, gap in state_phase_deps:
             if not (0 <= u < n and 0 <= v < n and wrap in (0, 1) and gap >= 0):
-                raise ValueError(f"Invalid register phase dependency: {(u, v, wrap, gap)}")
+                raise ValueError(f"Invalid state phase dependency: {(u, v, wrap, gap)}")
 
     if verbose:
         print(f"[Python Z3 Loop] Starting scheduling for {n} tasks")
@@ -390,7 +391,7 @@ def z3_schedule_loop_python(
         print(f"[Python Z3 Loop] IIs: {iis}")
         print(f"[Python Z3 Loop] Resource flags: {resource_flags}")
         print(f"[Python Z3 Loop] Data dependencies with distances: {data_deps}")
-        print(f"[Python Z3 Loop] Register phase dependencies: {register_phase_deps}")
+        print(f"[Python Z3 Loop] State phase dependencies: {state_phase_deps}")
         print(f"[Python Z3 Loop] Resource dependencies: {resource_deps}")
         print(f"[Python Z3 Loop] Owner exclusions: {owner_exclusion_deps}")
         print(f"[Python Z3 Loop] Stage-order dependencies: {stage_order_deps}")
@@ -455,7 +456,7 @@ def z3_schedule_loop_python(
             if idxs:
                 solver.add(z3.Sum([buffer_vars[i] * buffer_sizes[i] for i in idxs]) <= cap)
 
-        for u, v, wrap, gap in register_phase_deps:
+        for u, v, wrap, gap in state_phase_deps:
             solver.add(r_vars[v] + wrap * ii_mid >= r_vars[u] + gap)
 
         # Add data dependency constraints with distance
@@ -633,7 +634,7 @@ def z3_schedule_loop_python(
                 "iis": iis,
                 "resource_flags": resource_flags,
                 "data_dependencies": data_deps,
-                "register_phase_dependencies": register_phase_deps,
+                "state_phase_dependencies": state_phase_deps,
                 "resource_dependencies": resource_deps,
                 "owner_exclusions": owner_exclusion_deps,
                 "manual_schedule": manual_schedule,
@@ -817,7 +818,7 @@ def z3_schedule_loop_ffi(
     enable_offset=False,
     manual_stages=None,
     manual_schedule=False,
-    register_phase_deps=None,
+    state_phase_deps=None,
 ):
     """FFI wrapper for z3_schedule_loop_python.
 
@@ -839,7 +840,7 @@ def z3_schedule_loop_ffi(
     if memory_groups is not None:
         for i in range(len(memory_groups)):
             memory_groups_list.append(list(memory_groups[i]))
-    register_phase_deps_list = _convert_int_tuples(register_phase_deps, 4)
+    state_phase_deps_list = _convert_int_tuples(state_phase_deps, 4)
     data_deps_list = _convert_int_tuples(data_deps, 4)
     resource_deps_list = _convert_int_tuples(resource_deps, 2)
     stage_order_deps_list = _convert_int_tuples(stage_order_deps, 2)
@@ -868,7 +869,7 @@ def z3_schedule_loop_ffi(
             enable_offset=bool(enable_offset),
             manual_stages=manual_stages_list,
             manual_schedule=bool(manual_schedule),
-            register_phase_deps=register_phase_deps_list,
+            state_phase_deps=state_phase_deps_list,
             seed=42,
         )
 
