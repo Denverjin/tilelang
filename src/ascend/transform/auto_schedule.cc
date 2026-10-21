@@ -191,7 +191,8 @@ uint16_t ManualRegisterPhaseMask(const std::vector<IRStructure *> &nodes,
         writer_stage = stages[i];
       }
       // A loop that only reads this mode stays in its writer's region as one
-      // outer unit. Its inner stages and buffer versions do not change the mode.
+      // outer unit. Its inner stages and buffer versions do not change the
+      // mode.
       if (reads && (writer_stage < 0 || stages[i] != writer_stage)) {
         valid = false;
         break;
