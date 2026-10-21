@@ -1475,6 +1475,29 @@ static void PlanExplicitL0BReuseRing(ScheduledTIR *scheduled_tir) {
     auto found = owners.find(storage);
     if (found == owners.end() || found->second.empty())
       return;
+    // Joining disjoint owners requires a counter. PrepareMultiBuffer can
+    // advance that counter only when each owner's storage accesses share a
+    // stage, so keep independent rings unless scheduling preserves this.
+    for (ControlNode *owner : found->second) {
+      std::optional<int> storage_stage;
+      for (const auto &child : owner->children) {
+        if (!child->TouchesStorage(storage))
+          continue;
+        int stage = child->GetStage();
+        if (storage_stage.has_value() && storage_stage.value() != stage)
+          return;
+        storage_stage = stage;
+      }
+      if (!storage_stage.has_value())
+        return;
+      if (storage_stage.value() == kUnscheduledStage) {
+        // Automatic offsets are not known yet. Without offsets, scheduling
+        // collapses all automatic tasks to stage zero.
+        auto enable_offset = owner->control->annotations.Get("enable_offset");
+        if (enable_offset.has_value() && enable_offset.value().cast<bool>())
+          return;
+      }
+    }
     for (TaskNode *task : tasks) {
       auto touches = [&](const auto &regions) {
         return std::any_of(regions.begin(), regions.end(),

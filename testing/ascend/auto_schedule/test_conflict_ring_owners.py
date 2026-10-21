@@ -149,6 +149,71 @@ def test_conflict_hint_does_not_join_nested_storage_owners():
         tilelang.lower(main, target="ascend", enable_device_compile=False)
 
 
+@pytest.mark.parametrize(
+    "automatic,staged_second",
+    [(False, False), (False, True), (True, False)],
+    ids=["manual-first", "manual-second", "automatic-offset"],
+)
+@pytest.mark.parametrize("disable_reuse", [False, True])
+def test_conflict_hint_keeps_independent_owners_when_stages_can_differ(automatic, staged_second, disable_reuse):
+    @T.prim_func
+    def main(Q: T.Tensor((16, 16), "bfloat16"), K: T.Tensor((16, 16), "bfloat16"), C: T.Tensor((2, 16, 16), "float32")):
+        with T.Kernel(1):
+            q = T.alloc_l1((16, 16), "bfloat16")
+            k = T.alloc_l1((16, 16), "bfloat16")
+            aq = T.alloc_l0a((16, 16), "bfloat16")
+            av = T.alloc_l0a((16, 16), "bfloat16")
+            bq = T.alloc_l0b((16, 16), "bfloat16")
+            bv = T.alloc_l0b((16, 16), "bfloat16")
+            cq = T.alloc_l0c((16, 16), "float32")
+            cv = T.alloc_l0c((16, 16), "float32")
+            T.annotate_buffer_versions({q: 1, k: 1, aq: 4, av: 1, bq: 4, bv: 4, cq: 1, cv: 1})
+            T.assume_conflict(bq, bv)
+            T.copy(Q, q)
+            T.copy(K, k)
+            T.copy(q, av)
+            staged = bv if staged_second else bq
+            other = bq if staged_second else bv
+            for _i in T.Pipelined(4, num_stages=4, annotations={"enable_offset": True}):
+                if automatic:
+                    T.copy(q, aq)
+                    T.copy(k, staged)
+                    T.gemm(aq, staged, cq, transpose_B=True, clear_accum=True)
+                else:
+                    with T.Stage(0):
+                        T.copy(q, aq)
+                        T.copy(k, staged)
+                    with T.Stage(1):
+                        T.gemm(aq, staged, cq, transpose_B=True, clear_accum=True)
+            T.copy(cq, C[0, :, :])
+            for _j in T.Pipelined(4, num_stages=4):
+                with T.Stage(0):
+                    T.copy(k, other)
+                    T.gemm(av, other, cv, transpose_B=True, clear_accum=True)
+            T.copy(cv, C[1, :, :])
+
+    snapshots = {}
+
+    @tvm.instrument.pass_instrument
+    class Capture:
+        def run_after_pass(self, mod, info):
+            if info.name in ("tl.PrepareMultiBuffer", "tl.MaterializeMultiBuffer"):
+                snapshots[info.name] = mod
+
+    with tvm.transform.PassContext(config={"tl.disable_shared_memory_reuse": disable_reuse}, instruments=[Capture()]):
+        artifact = tilelang.lower(main, target="ascend", enable_device_compile=False)
+
+    prepared = snapshots["tl.PrepareMultiBuffer"]
+    owners = []
+    for name in ("staged", "other"):
+        buffer = allocated_buffer(prepared, name)
+        (owner,) = [loop for loop in nodes(prepared, tirx.For) if buffer.data in loop.annotations.get("multi_buffer_eligible", [])]
+        owners.append(owner)
+        assert int(allocated_buffer(snapshots["tl.MaterializeMultiBuffer"], name).shape[0]) == 4
+    assert not owners[0].same_as(owners[1])
+    assert artifact.kernel_source
+
+
 @tilelang.testing.requires_ascend
 def test_retimed_layout_pair_values_across_owner_lengths_and_launches():
     import torch

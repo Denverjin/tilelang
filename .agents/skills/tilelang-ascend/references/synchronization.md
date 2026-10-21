@@ -337,6 +337,9 @@ equal-sized L0B pair with matching fixed automatic version counts can share a
 ring clock when a whole-buffer hint uses the default iteration matching and all
 accesses belong to disjoint automatic owners. Explicit iteration indexing, manual
 versions, strides, and offsets keep the ordinary dependency path.
+Each owner's accesses must also be guaranteed to use a single schedule stage.
+Cross-stage manual accesses and automatic scheduling with `enable_offset=True`
+keep independent rings because the shared counter cannot span those stages.
 
 ## Trace the complete storage protocol
 
