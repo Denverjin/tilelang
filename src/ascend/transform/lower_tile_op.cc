@@ -347,10 +347,14 @@ private:
 
     // Record the mapping from buffer data var to buffer for later lookup
     for (auto buffer : op->alloc_buffers) {
-      buffer_map_.insert({buffer->data, buffer});
+      // An enclosing layout annotation can still name the logical buffer
+      // before multi-buffer materialization. The allocation owns the physical
+      // shape, including version axes, used to decode flat pointer offsets.
+      buffer_map_.insert_or_assign(buffer->data, buffer);
     }
     for (auto match_buffer : op->match_buffers) {
-      buffer_map_.insert({match_buffer->buffer->data, match_buffer->buffer});
+      buffer_map_.insert_or_assign(match_buffer->buffer->data,
+                                   match_buffer->buffer);
       buffer_data_to_buffer_.Set(match_buffer->buffer->data,
                                  match_buffer->buffer);
     }
@@ -369,6 +373,11 @@ private:
                             .as<Map<Buffer, Layout>>()
                             .value();
       for (auto [buffer, layout] : layout_map) {
+        // Address-backed views have layouts but no allocation or match_buffer.
+        // Register them so DMA pointers receive the same layout/pitch remap.
+        buffer_map_.insert({buffer->data, buffer});
+        if (!buffer_data_to_buffer_.count(buffer->data))
+          buffer_data_to_buffer_.Set(buffer->data, buffer);
         buffer_remap_.Set(buffer,
                           makeBufferWithLayout(buffer, layout, var_remap_));
         layout_map_.Set(buffer, layout);
@@ -585,12 +594,33 @@ private:
       // Get original and new buffer shapes.
       Array<PrimExpr> old_shape = original_buffer->shape;
       Array<PrimExpr> new_shape = new_buffer->shape;
+      Layout access_layout = layout;
+      DataType access_dtype = access_ptr_call->args[0].dtype();
+      int buffer_bits =
+          original_buffer->dtype.bits() * original_buffer->dtype.lanes();
+      int access_bits = access_dtype.bits() * access_dtype.lanes();
+      if (access_bits != buffer_bits) {
+        // A raw access pointer retains its element type but not its Buffer
+        // identity. Its offset is in that type's elements, even when the data
+        // Var resolves to a differently typed allocation. Reinterpret the
+        // logical layout before mapping the offset, preserving sub-element
+        // lanes and expressing the physical result in the pointer's units.
+        PrimExpr elements = Integer(1);
+        for (const PrimExpr &extent : old_shape) {
+          elements *= extent;
+        }
+        old_shape = {analyzer_->Simplify(
+            floordiv(elements * Integer(buffer_bits), Integer(access_bits)))};
+        access_layout = layout->Reshape(
+            old_shape, analyzer_, Integer(buffer_bits), Integer(access_bits));
+        new_shape = access_layout->OutputShape();
+      }
       Array<PrimExpr> zero_indices;
       for (size_t i = 0; i < old_shape.size(); ++i) {
         zero_indices.push_back(make_zero(elem_offset.dtype()));
       }
       Array<PrimExpr> forward_indices = RemapAccessIndices(
-          zero_indices, old_shape, new_shape, layout, elem_offset);
+          zero_indices, old_shape, new_shape, access_layout, elem_offset);
       PrimExpr new_offset = 0;
       PrimExpr stride_offset = 1;
       for (int i = static_cast<int>(new_shape.size()) - 1; i >= 0; --i) {
@@ -1081,6 +1111,7 @@ private:
 
   Stmt VisitStmt_(const BindNode *op) final {
     PrimExpr value = this->VisitExpr(op->value);
+    Var var = var_remap_.Get(op->var).value_or(op->var);
     bool recorded = false;
     if (value->IsInstance<BufferLoadNode>()) {
       bind_var_to_expr_[op->var] = value;
@@ -1089,10 +1120,11 @@ private:
     if (SideEffect(value) <= CallEffectKind::kPure) {
       analyzer_->Bind(op->var, value);
     }
-    if (value.same_as(op->value)) {
+    if (value.same_as(op->value) && var.same_as(op->var)) {
       return GetRef<Stmt>(op);
     } else {
       auto n = this->CopyOnWrite(op);
+      n->var = var;
       n->value = value;
       return Stmt(n);
     }
