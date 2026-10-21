@@ -566,6 +566,38 @@ def test_dynamic_sf_copy_requires_proven_data_capacity(axis, lower_bound, upper_
         _equal(load.args[4:6], [tirx.floordiv(n + 15, 16), 1] if axis == "mn" else [1, n])
 
 
+@pytest.mark.parametrize("major_mn,pitch,offset", [(False, 4, 8704), (True, 8, 12288)], ids=["qk", "pv"])
+def test_address_backed_l0_view_remaps_partial_copy_origin(major_mn, pitch, offset):
+    """A view has no alloc_buffer entry, but its DMA origin still uses NZ."""
+    import re
+    import tilelang
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1):
+            src = T.alloc_l1((32, 128), "bfloat16")
+            storage = T.alloc_l0b((16384,), "bfloat16")
+            dst = T.make_tensor_from_addr(
+                T.access_ptr(storage[0], "rw", extent=16384), (2, 64, 128), "bfloat16", storage_scope="shared.l0b"
+            )
+            T.annotate_layout(
+                {
+                    src: make_ascend_major_k_layout(src),
+                    dst: make_ascend_major_mn_layout(dst) if major_mn else make_ascend_major_k_layout(dst),
+                }
+            )
+            with T.Cube():
+                T.copy(src, dst[1, 32:, :], l0_pitch=pitch)
+
+    with tvm.transform.PassContext(config={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False}):
+        lowered = tilelang.lower(main, target="ascend")
+    source = lowered.kernel_source
+    instruction = "asc_copy_l12l0b_transpose" if major_mn else "asc_copy_l12l0b"
+    assert re.search(rf"{instruction}\(.*dst \+ {offset}\)", source), source
+    # The remapped data variable must still be defined by the pointer binding.
+    assert re.search(r"__cb__ bfloat16_t \*dst =", source), source
+
+
 @pytest.mark.parametrize("normalize", [False, True])
 def test_sf_tail_source_fits_its_fractal_allocation(normalize):
     src = tirx.decl_buffer((24, 4), "uint8", name="src", scope="shared.l1")

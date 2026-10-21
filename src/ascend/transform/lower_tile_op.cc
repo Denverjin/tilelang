@@ -347,10 +347,14 @@ private:
 
     // Record the mapping from buffer data var to buffer for later lookup
     for (auto buffer : op->alloc_buffers) {
-      buffer_map_.insert({buffer->data, buffer});
+      // An enclosing layout annotation can still name the logical buffer
+      // before multi-buffer materialization. The allocation owns the physical
+      // shape, including version axes, used to decode flat pointer offsets.
+      buffer_map_.insert_or_assign(buffer->data, buffer);
     }
     for (auto match_buffer : op->match_buffers) {
-      buffer_map_.insert({match_buffer->buffer->data, match_buffer->buffer});
+      buffer_map_.insert_or_assign(match_buffer->buffer->data,
+                                   match_buffer->buffer);
       buffer_data_to_buffer_.Set(match_buffer->buffer->data,
                                  match_buffer->buffer);
     }
@@ -369,6 +373,11 @@ private:
                             .as<Map<Buffer, Layout>>()
                             .value();
       for (auto [buffer, layout] : layout_map) {
+        // Address-backed views have layouts but no allocation or match_buffer.
+        // Register them so DMA pointers receive the same layout/pitch remap.
+        buffer_map_.insert({buffer->data, buffer});
+        if (!buffer_data_to_buffer_.count(buffer->data))
+          buffer_data_to_buffer_.Set(buffer->data, buffer);
         buffer_remap_.Set(buffer,
                           makeBufferWithLayout(buffer, layout, var_remap_));
         layout_map_.Set(buffer, layout);
@@ -1081,6 +1090,7 @@ private:
 
   Stmt VisitStmt_(const BindNode *op) final {
     PrimExpr value = this->VisitExpr(op->value);
+    Var var = var_remap_.Get(op->var).value_or(op->var);
     bool recorded = false;
     if (value->IsInstance<BufferLoadNode>()) {
       bind_var_to_expr_[op->var] = value;
@@ -1089,10 +1099,11 @@ private:
     if (SideEffect(value) <= CallEffectKind::kPure) {
       analyzer_->Bind(op->var, value);
     }
-    if (value.same_as(op->value)) {
+    if (value.same_as(op->value) && var.same_as(op->var)) {
       return GetRef<Stmt>(op);
     } else {
       auto n = this->CopyOnWrite(op);
+      n->var = var;
       n->value = value;
       return Stmt(n);
     }
