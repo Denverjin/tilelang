@@ -32,10 +32,11 @@ def _retimed_layout_pair(qk_steps=4, pv_steps=4):
             T.copy(Q, q)
             T.copy(K[:32, :], k0)
             T.copy(K[32:, :], k1)
+            # Keep the Cube mode fixed so this regression isolates storage
+            # ownership from separately scheduled configuration changes.
             for step in T.Pipelined(3, num_stages=2, annotations={"enable_offset": True}):
                 T.assume_conflict(bq, bv)
                 with T.Stage(0):
-                    T.set_mmad_direction("m")
                     for d in T.Pipelined(qk_steps, num_stages=4):
                         with T.Stage(0):
                             T.copy(q, aq)
@@ -44,8 +45,7 @@ def _retimed_layout_pair(qk_steps=4, pv_steps=4):
                                 T.copy(k1, bq[32:, :], l0_pitch=4)
                             T.gemm(aq, bq, cq, transpose_B=True, clear_accum=d == 0)
                     T.copy(cq, CQ[step, :, :])
-                with T.Stage(1), T.IssuePhase({"MTE1": 1, "M": 1}):
-                    T.set_mmad_direction("n")
+                with T.Stage(1):
                     for _region in T.Pipelined(1, num_stages=4):
                         with T.Stage(0):
                             T.copy(q[:, :64], aq[:, :64])
