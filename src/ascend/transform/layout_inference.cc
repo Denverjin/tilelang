@@ -316,6 +316,10 @@ public:
       // Helper: propagate inferred layout to alias buffers (same data Var)
       auto propagate_alias = [&](const Buffer &src_buffer,
                                  const Layout &src_layout) {
+        // Cube operands constrain their own views. Only aliases without a
+        // constraint inherit a reshaped layout after inference completes.
+        if (IsAscendCubeBuffer(src_buffer))
+          return;
         if (!buffer_data_to_buffers_.count(src_buffer->data))
           return;
         const auto &siblings = buffer_data_to_buffers_[src_buffer->data];
@@ -1003,9 +1007,10 @@ private:
       // populated.
       if (pushed_region_scope && op->annotations.count(attr::kLayoutMap)) {
         auto map = op->annotations.Get(attr::kLayoutMap)
-                       ->as<Map<Var, Layout>>()
-                       .value();
-        for (const auto &[var, layout] : map) {
+                       ->cast<Map<ObjectRef, Layout>>();
+        for (const auto &[key, layout] : map) {
+          Var var = key.as<Buffer>() ? Downcast<Buffer>(key)->data
+                                     : Downcast<Var>(key);
           if (buffer_data_to_buffers_.count(var)) {
             for (const auto &buffer : buffer_data_to_buffers_[var]) {
               annotated_layout_map_.Set(buffer, layout);
@@ -1038,13 +1043,18 @@ private:
 
     // After visiting, apply layouts to all collected buffers
     if (op->annotations.count(attr::kLayoutMap)) {
-      // Check if the layout map is Map<Var, Layout>
       auto map =
-          op->annotations.Get(attr::kLayoutMap)->as<Map<Var, Layout>>().value();
-      for (const auto &[var, layout] : map) {
+          op->annotations.Get(attr::kLayoutMap)->cast<Map<ObjectRef, Layout>>();
+      for (const auto &[key, layout] : map) {
+        Optional<Buffer> annotated = key.as<Buffer>();
+        Var var =
+            annotated.defined() ? annotated.value()->data : Downcast<Var>(key);
         ICHECK(buffer_data_to_buffers_.count(var))
             << "buffer " << var << " is not found in the block";
-        const auto &buffers = buffer_data_to_buffers_[var];
+        Array<Buffer> buffers =
+            annotated.defined() && IsAscendCubeBuffer(annotated.value())
+                ? Array<Buffer>{annotated.value()}
+                : buffer_data_to_buffers_[var];
         ICHECK(!buffers.empty()) << "buffer list for " << var << " is empty";
         for (const auto &buffer : buffers) {
           if (!IsReducerV2Buffer(buffer)) {

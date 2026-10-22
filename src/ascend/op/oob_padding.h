@@ -53,8 +53,9 @@ enum class DMAPath {
 DMAPath GetDMAPath(const Buffer &src, const Buffer &dst);
 
 /*!
- * \brief Look up a buffer's inferred Layout in a layout map, matching either
- * the buffer object or its underlying data Var. Returns nullopt if absent.
+ * \brief Look up a buffer's inferred Layout by Buffer identity. Non-Cube
+ * buffers may fall back to an alias with the same data Var; Cube views can
+ * have distinct layouts and require an exact match. Returns nullopt if absent.
  */
 Optional<Layout> FindLayoutForBuffer(const LayoutMap &layout_map,
                                      const Buffer &buffer);

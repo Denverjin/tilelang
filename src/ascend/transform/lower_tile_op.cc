@@ -695,10 +695,11 @@ private:
       }
 
       BufferLoad load = Downcast<BufferLoad>(access_ptr_call->args[0]);
-      PrimExpr extent = access_ptr_call->args[1];
-      PrimExpr rw_mask = access_ptr_call->args[2];
+      PrimExpr extent = VisitExpr(access_ptr_call->args[1]);
+      PrimExpr rw_mask = VisitExpr(access_ptr_call->args[2]);
 
-      Array<PrimExpr> indices = load->indices;
+      Array<PrimExpr> indices = load->indices.Map(
+          [&](const PrimExpr &index) { return VisitExpr(index); });
       Array<PrimExpr> old_shape = load->buffer->shape;
 
       ICHECK_EQ(indices.size(), old_shape.size())
@@ -738,6 +739,28 @@ private:
 
       Array<PrimExpr> new_args = {BufferLoad(new_buffer, new_indices), extent,
                                   rw_mask};
+      if (IsAscendCubeBuffer(remap_key)) {
+        size_t n = new_shape.size();
+        PrimExpr physical_offset = 0;
+        for (size_t i = 0; i < n; ++i)
+          physical_offset = physical_offset * new_shape[i] + new_indices[i];
+        if (auto pitch =
+                access_ptr_call->annotations.Get(attr::kL0AccessPitch)) {
+          ICHECK(IsL0ABuffer(remap_key) || IsL0BBuffer(remap_key));
+          ICHECK_GE(n, 4);
+          physical_offset +=
+              new_indices[n - 4] *
+              (Downcast<PrimExpr>(pitch.value()) - new_shape[n - 3]) *
+              new_shape[n - 2] * new_shape[n - 1];
+        }
+        layout_remap_.Set(new_buffer, layout.value());
+        result.rewritten = true;
+        result.expr =
+            Call(access_ptr_call->dtype, builtin::tvm_access_ptr(),
+                 {TypeAnnotation(new_buffer->dtype), new_buffer->data,
+                  analyzer_->Simplify(physical_offset), extent, rw_mask});
+        return result;
+      }
       if (buffer_remap_.count(remap_key)) {
         layout_remap_.Set(new_buffer, layout.value());
       }
@@ -1006,6 +1029,15 @@ private:
         new_call->args.Set(2, new_access_ptr.expr);
       }
       return call;
+    }
+
+    // Preserve the typed base until its view-specific layout and compact L0
+    // pitch have both been applied. Visiting BufferLoad first loses that view.
+    if (op->op.same_as(tl::access_ptr())) {
+      auto rewritten = HandleAccessPtrAndOffset(GetRef<Call>(op));
+      if (rewritten.rewritten)
+        return rewritten.expr;
+      return IRMutatorWithAnalyzer::VisitExpr_(op);
     }
 
     // Handle standalone tvm_access_ptr calls with layout transformation

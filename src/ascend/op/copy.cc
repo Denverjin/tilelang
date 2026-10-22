@@ -425,6 +425,16 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
 
   auto make_access_ptr = [&](const Buffer &buf, PrimExpr offset,
                              PrimExpr extent, int rw_mask) -> PrimExpr {
+    if (IsAscendCubeBuffer(buf)) {
+      Array<PrimExpr> indices(buf->shape.size(), I(0));
+      PrimExpr remaining = offset;
+      for (int i = static_cast<int>(buf->shape.size()) - 1; i >= 0; --i) {
+        indices.Set(i, i == 0 ? remaining : floormod(remaining, buf->shape[i]));
+        remaining = floordiv(remaining, buf->shape[i]);
+      }
+      return Call(DataType::Handle(), tl::access_ptr(),
+                  {BufferLoad(buf, indices), extent, I(rw_mask)});
+    }
     return Call(
         DataType::Handle(), builtin::tvm_access_ptr(),
         {TypeAnnotation(buf->dtype), buf->data, offset, extent, I(rw_mask)});

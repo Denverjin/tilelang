@@ -161,6 +161,74 @@ def test_alias_normalization_preserves_allocation_properties():
     assert allocation.same_as(normalized["main"].body.block.body.value.buffer)
 
 
+@pytest.mark.parametrize(
+    "shape,view_shape,transpose", [((64, 128), (64, 128), False), ((64, 128), (128, 64), True), ((17, 32), (32, 17), False)]
+)
+def test_independent_cube_views_preserve_their_matrix_geometry(shape, view_shape, transpose):
+    owner = tirx.decl_buffer(shape, "bfloat16", name="owner", scope="shared.l0b")
+    view = tirx.decl_buffer(view_shape, "bfloat16", name="view", data=owner.data)
+    layouts = {
+        owner: tilelang.layout.make_ascend_major_k_layout(owner),
+        view: (tilelang.layout.make_ascend_major_k_layout if transpose else tilelang.layout.make_ascend_major_mn_layout)(view),
+    }
+    body = tirx.SeqStmt([tirx.Evaluate(owner[1, 0]), tirx.BufferStore(view, tirx.const(7, "bfloat16"), [0, 1])])
+    block = tirx.SBlock([], [], [], "root", body, alloc_buffers=[owner], annotations={"layout_map": layouts})
+    before = tvm.IRModule({"main": tirx.PrimFunc([], tirx.SBlockRealize([], True, block))})
+    after = transform.NormalizeAscendFractalStorage()(before)
+    root = after["main"].body.block
+    read, write = root.body.seq[0].value, root.body.seq[1]
+    assert not read.buffer.same_as(write.buffer)
+    assert read.buffer.data.same_as(write.buffer.data)
+    assert tuple(int(x) for x in read.indices) == (1, 0)
+    assert tuple(int(x) for x in write.indices) == (0, 1)
+    assert tuple(int(x) for x in read.buffer.shape) == tuple((x + 15) // 16 * 16 for x in shape)
+    assert tuple(int(x) for x in write.buffer.shape) == tuple((x + 15) // 16 * 16 for x in view_shape)
+    assert len(root.alloc_buffers) == 1
+    assert not root.annotations["layout_map"][read.buffer].is_equal(root.annotations["layout_map"][write.buffer])
+    tvm.ir.assert_structural_equal(after, transform.NormalizeAscendFractalStorage()(after))
+
+
+def test_cube_views_with_different_padded_sizes_are_rejected():
+    owner = tirx.decl_buffer((15, 16), "bfloat16", scope="shared.l0b")
+    view = tirx.decl_buffer((8, 30), "bfloat16", data=owner.data)
+    block = tirx.SBlock(
+        [],
+        [],
+        [],
+        "root",
+        tirx.Evaluate(view[0, 0]),
+        alloc_buffers=[owner],
+        annotations={
+            "layout_map": {owner: tilelang.layout.make_ascend_major_k_layout(owner), view: tilelang.layout.make_ascend_major_k_layout(view)}
+        },
+    )
+    before = tvm.IRModule({"main": tirx.PrimFunc([], tirx.SBlockRealize([], True, block))})
+    with pytest.raises(tvm.error.InternalError, match="equal padded physical sizes"):
+        transform.NormalizeAscendFractalStorage()(before)
+
+
+@pytest.mark.parametrize("raw", [False, True], ids=["typed-view", "ambiguous-data-pointer"])
+def test_distinct_cube_layouts_require_typed_pointers(raw):
+    owner = tirx.decl_buffer((64, 128), "bfloat16", scope="shared.l0b")
+    view = tirx.decl_buffer((128, 64), "bfloat16", data=owner.data)
+    pointer = owner.access_ptr("r", offset=64, extent=1) if raw else T.access_ptr(view[1, 0], "r", extent=1)
+    before = kernel(
+        tirx.Evaluate(tirx.call_extern("int32", "consume", pointer)),
+        buffers=[owner],
+        annotations={
+            "layout_map": {owner: tilelang.layout.make_ascend_major_k_layout(owner), view: tilelang.layout.make_ascend_major_k_layout(view)}
+        },
+    )
+    if raw:
+        with pytest.raises(tvm.error.InternalError, match="Raw Cube pointers cannot select among distinct view layouts"):
+            transform.NormalizeAscendFractalStorage()(before)
+    else:
+        after = transform.NormalizeAscendFractalStorage()(before)
+        (pointer,) = calls(after, "tl.access_ptr")
+        assert tuple(int(x) for x in pointer.args[0].buffer.shape) == (128, 64)
+        assert tuple(int(x) for x in pointer.args[0].indices) == (1, 0)
+
+
 def test_non_rectangular_alias_region_is_rejected():
     # Three logical elements in different rows cannot become an 11-row DMA.
     with pytest.raises(tvm.error.InternalError, match="not a contiguous rectangular matrix"):

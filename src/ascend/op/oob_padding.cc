@@ -72,6 +72,10 @@ Optional<Layout> FindLayoutForBuffer(const LayoutMap &layout_map,
   if (layout_map.count(buffer)) {
     return layout_map[buffer];
   }
+  // A Cube alias may have a different canonical matrix interpretation.
+  // Borrowing a sibling's layout here suppresses its own inference constraints.
+  if (IsAscendCubeBuffer(buffer))
+    return std::nullopt;
   for (const auto &kv : layout_map) {
     if (kv.first->data.same_as(buffer->data)) {
       return kv.second;

@@ -61,10 +61,10 @@ private:
   }
 };
 
-// Every alias has the same padded matrix shape and canonical layout. Its old
-// reshape is absorbed into indices/regions here, not a special layout or hidden
-// pitch. Ordinary capacity accounting and version expansion therefore see the
-// complete storage through every alias. GM/UB and compact NZ are untouched.
+// Ordinary reshapes inherit a canonical matrix interpretation and have their
+// indices normalized to it. Independently constrained Cube views retain their
+// own interpretation, but share one allocation and an equal physical pitch.
+// GM/UB and compact NZ are untouched.
 class FractalStorageNormalizer : public arith::IRMutatorWithAnalyzer {
 public:
   static PrimFunc Rewrite(PrimFunc func) {
@@ -86,12 +86,27 @@ public:
         ICHECK(TryExtractAscendFractalLayout(collector.layouts[anchor.value()],
                                              anchor.value(), &lhs));
         ICHECK(TryExtractAscendFractalLayout(layout, buffer, &rhs));
-        ICHECK(lhs.kind == rhs.kind &&
-               collector.layouts[anchor.value()]->IsEqual(layout.get()) &&
-               anchor.value()->dtype.bits() == buffer->dtype.bits())
-            << "Conflicting canonical Cube views of " << buffer->name;
-        if (collector.used_buffers.count(buffer) &&
-            !collector.used_buffers.count(anchor.value()))
+        if (!collector.layouts[anchor.value()]->IsEqual(layout.get())) {
+          PrimExpr lhs_bits = Integer(anchor.value()->dtype.bits());
+          PrimExpr rhs_bits = Integer(buffer->dtype.bits());
+          for (const PrimExpr &extent :
+               collector.layouts[anchor.value()]->OutputShape())
+            lhs_bits = lhs_bits * extent;
+          for (const PrimExpr &extent : layout->OutputShape())
+            rhs_bits = rhs_bits * extent;
+          ICHECK(analyzer.CanProveEqual(lhs_bits, rhs_bits))
+              << "Cube views sharing storage require equal padded physical "
+                 "sizes: "
+              << anchor.value()->name << " and " << buffer->name;
+          rewriter.independent_views_.insert(buffer->data);
+        }
+        ICHECK_EQ(anchor.value()->dtype.bits(), buffer->dtype.bits())
+            << "Cube aliases must preserve element width: " << buffer->name;
+        if ((collector.used_buffers.count(buffer) &&
+             !collector.used_buffers.count(anchor.value())) ||
+            (collector.used_buffers.count(buffer) ==
+                 collector.used_buffers.count(anchor.value()) &&
+             buffer.same_as(collector.owners[buffer->data])))
           rewriter.anchors_.Set(buffer->data, buffer);
       } else {
         rewriter.anchors_.Set(buffer->data, buffer);
@@ -104,6 +119,17 @@ public:
             << "Cube alias accesses must use the canonical operand dtype: "
             << buffer->name << " has " << buffer->dtype << ", expected "
             << anchor.value()->dtype;
+        if (rewriter.independent_views_.count(buffer->data)) {
+          auto layout = collector.layouts.Get(buffer);
+          if (layout.has_value() && IsAscendFractalLayout(layout.value())) {
+            anchor = buffer;
+          } else {
+            ICHECK(!collector.used_buffers.count(buffer))
+                << "Each accessed Cube view sharing storage with distinct "
+                   "layouts requires its own canonical layout: "
+                << buffer->name;
+          }
+        }
         rewriter.RegisterBuffer_(buffer, anchor.value(),
                                  collector.owners[buffer->data],
                                  collector.layouts[anchor.value()]);
@@ -156,10 +182,13 @@ private:
       shape.Set(axis, analyzer_->Simplify(
                           floordiv(shape[axis] + align - 1, align) * align));
     }
-    // Coalesce aliases to one Buffer identity and geometry so versioning
-    // expands the allocation and every use together. An unused equal-width
-    // backing allocation may adopt the canonical operand dtype.
-    Buffer padded = canonical_buffers_.Get(buffer->data).value_or(owner);
+    // Ordinary aliases coalesce to one Buffer identity and geometry. Distinct
+    // canonical views retain their own geometry on the same data Var. An unused
+    // equal-width backing allocation may adopt the canonical operand dtype.
+    bool independent = independent_views_.count(buffer->data);
+    Buffer padded = independent
+                        ? buffer
+                        : canonical_buffers_.Get(buffer->data).value_or(owner);
     if (!StructuralEqual()(padded->shape, shape) || !padded->strides.empty() ||
         padded->dtype != anchor->dtype) {
       auto *writer = padded.CopyOnWrite();
@@ -183,7 +212,9 @@ private:
       break;
     }
     buffers_.Set(buffer, padded);
-    canonical_buffers_.Set(buffer->data, padded);
+    buffer_anchors_.Set(buffer, anchor);
+    if (!independent || buffer.same_as(owner))
+      canonical_buffers_.Set(buffer->data, padded);
     canonical_layouts_.Set(padded, padded_layout);
   }
 
@@ -204,7 +235,7 @@ private:
     });
     if (!buffers_.count(buffer))
       return BufferRegion(buffer, ranges);
-    if (!StructuralEqual()(buffer->shape, anchors_[buffer->data]->shape)) {
+    if (!StructuralEqual()(buffer->shape, buffer_anchors_[buffer]->shape)) {
       // A dense reshape is injective only while trailing region extents do
       // not wrap across the original view's strides. Otherwise equal bounding
       // box volume alone can hide duplicated logical elements.
@@ -456,7 +487,7 @@ private:
         // GM region unchanged: extra storage does not authorize an extra read.
         Copy rewritten(call->args, call->annotations);
         Array<Range> ranges = rewritten->dst_range;
-        const auto &logical_shape = anchors_[copy->dst->data]->shape;
+        const auto &logical_shape = buffer_anchors_[copy->dst]->shape;
         for (size_t i = 0; i < ranges.size(); ++i) {
           if (analyzer_->CanProveEqual(ranges[i]->min, 0) &&
               analyzer_->CanProveEqual(ranges[i]->extent, logical_shape[i]))
@@ -472,6 +503,9 @@ private:
     if (op->op.same_as(builtin::tvm_access_ptr())) {
       auto data = op->args[1].as<Var>();
       if (data && anchors_.count(data.value())) {
+        ICHECK(!independent_views_.count(data.value()))
+            << "Raw Cube pointers cannot select among distinct view layouts; "
+               "use T.access_ptr(view[...], ...)";
         Buffer anchor = anchors_[data.value()];
         ICHECK(op->args[0].dtype() == anchor->dtype)
             << "Cube raw pointer must use the canonical operand dtype "
@@ -520,6 +554,8 @@ private:
     return block;
   }
   Map<Var, Buffer> anchors_;
+  Map<Buffer, Buffer> buffer_anchors_;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> independent_views_;
   Map<Var, Buffer> canonical_buffers_;
   Map<Buffer, Buffer> buffers_;
   LayoutMap canonical_layouts_;
