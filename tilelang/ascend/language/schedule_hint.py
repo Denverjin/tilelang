@@ -145,16 +145,14 @@ def Stage(stage: int):
     ``T.Pipelined(..., num_stages=...)`` controls the automatic buffer-version
     search bound; it does not limit the values accepted by ``T.Stage``.
 
-    Single-element ``local.var`` buffers and hardware configuration registers
-    share one physical state across stages. Reads retain their reaching write
-    in logical stage order (source order within a stage), and must precede the
-    next physical overwrite, at most one pipeline round away. Independent
-    generations can therefore use nonadjacent stages. Reads and writes within
-    one task are summarized without ordering, so even a read after a local
-    write conservatively retains its incoming-value dependency.
-    Control and pipe fences remain logical; unresolved conditional writes,
-    opaque effects, and cross-stage scalar snapshots retain conservative
-    dependencies.
+    Hardware configuration registers (HF32, MMAD direction, padding, and atomic
+    mode) each share one physical value across stages. Their setters overwrite
+    that value; readers retain the reaching setter in logical stage order and
+    must precede the next physical overwrite, at most one pipeline round away.
+    Independent set/use groups can therefore use nonadjacent stages.
+    Conditional setters and opaque effects retain conservative dependencies.
+    Scalar buffers, copied scalar snapshots, and control/pipe fences keep their
+    existing logical dependency rules.
 
     Example
     -------

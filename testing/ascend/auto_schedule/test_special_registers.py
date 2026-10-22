@@ -1,4 +1,4 @@
-"""Single-state dependencies participate in scheduling and core placement."""
+"""Special-register dependencies participate in scheduling and core placement."""
 
 from unittest.mock import patch
 
@@ -262,7 +262,7 @@ def test_manual_cube_mode_regions_keep_nested_consumers(mode):
     original = z3_scheduler.z3_schedule_loop_python
 
     def capture(*args, **kwargs):
-        phases.append(kwargs["state_phase_deps"])
+        phases.append(kwargs["register_phase_deps"])
         return original(*args, **kwargs)
 
     with patch.object(z3_scheduler, "z3_schedule_loop_python", side_effect=capture):
@@ -324,7 +324,7 @@ def test_manual_cube_mode_regions_inspect_nested_effects(nested):
 
 
 @pytest.mark.parametrize("mode", ["hf32", "mmad-direction"])
-def test_manual_state_regions_include_nested_writers(mode):
+def test_manual_configuration_regions_include_nested_writers(mode):
     before, _ = _manual_cube_mode_loop([0, 0, 3, 3], mode, nested_readers=True, nested_effect="mode-writer")
     after = transform.AutoSchedule()(before)
     children = after["main"].body.block.body.body.body.seq
@@ -360,78 +360,20 @@ def test_manual_configuration_generations_use_one_physical_state(mode):
         tvm.ir.assert_structural_equal(child.body.body, operation)
 
 
-def _scalar_state_loop(stages, *, accumulate=False, single_writer=False):
+def test_manual_scalar_buffers_keep_logical_dependencies():
     x = tirx.decl_buffer((1,), "int32", name="x", scope="local.var")
     out = tirx.decl_buffer((8, 2), "int32", name="O")
     i = tirx.Var("i", "int32")
     operations = [
-        tirx.BufferStore(x, (x[0] if accumulate else 0) + i + 10, [0]),
+        tirx.BufferStore(x, i + 10, [0]),
         tirx.BufferStore(out, x[0], [i, 0]),
-        tirx.BufferStore(x, (x[0] if accumulate else 0) + i + 100, [0]),
+        tirx.BufferStore(x, i + 100, [0]),
         tirx.BufferStore(out, x[0], [i, 1]),
     ]
-    if single_writer:
-        operations = operations[:2]
-    body = seq(*(unit(op, core=1, stage=stage, cost=(1, 1)) for op, stage in zip(operations, stages)))
+    body = seq(*(unit(op, core=1, stage=stage, cost=(1, 1)) for op, stage in zip(operations, [0, 0, 3, 3])))
     loop = tirx.For(i, 0, 8, tirx.ForKind.SERIAL, body, annotations={"enable_offset": True})
-    return kernel(unit(loop, core=None, stage=-1), buffers=[x], params=[out]), operations
-
-
-@pytest.mark.parametrize("stages", [[0, 0, 3, 3], [4, 4, 9, 9], [5, 5, 2, 2]])
-def test_manual_scalar_generations_preserve_each_read(stages):
-    before, operations = _scalar_state_loop(stages)
-    after = transform.AutoSchedule()(before)
-    children = after["main"].body.block.body.body.body.seq
-    assert [int(child.node["stage"]) for child in children] == stages
-    for child, operation in zip(children, operations):
-        tvm.ir.assert_structural_equal(child.body.body, operation)
-
-
-def test_manual_scalar_read_precedes_next_iteration_overwrite():
-    before, operations = _scalar_state_loop([0, 1], single_writer=True)
-    after = transform.AutoSchedule()(before)
-    children = after["main"].body.block.body.body.body.seq
-    # At physical round q, read x from q-1 before assigning x for q. A
-    # write-before-read modulo schedule compiles but returns the wrong value.
-    assert [int(child.node["stage"]) for child in children] == [1, 0]
-    for child, operation in zip(children, reversed(operations)):
-        tvm.ir.assert_structural_equal(child.body.body, operation)
-
-
-@pytest.mark.parametrize("accumulate, stages, single_writer", [(True, [0, 0, 3, 3], False), (False, [0, 2], True)])
-def test_manual_scalar_state_rejects_overwritten_generations(accumulate, stages, single_writer):
-    before, _ = _scalar_state_loop(stages, accumulate=accumulate, single_writer=single_writer)
+    before = kernel(unit(loop, core=None, stage=-1), buffers=[x], params=[out])
+    # Register set/use groups may cross these stages, but ordinary scalar
+    # storage retains its logical WAW and reuse dependencies.
     with pytest.raises(RuntimeError, match="Manual schedule constraints are infeasible"):
         transform.AutoSchedule()(before)
-
-
-def test_manual_scalar_recurrence_keeps_its_update_chain():
-    before, operations = _scalar_state_loop([4, 4, 4, 4], accumulate=True)
-    after = transform.AutoSchedule()(before)
-    children = after["main"].body.block.body.body.body.seq
-    for child, operation in zip(children, operations):
-        tvm.ir.assert_structural_equal(child.body.body, operation)
-
-
-@pytest.mark.parametrize("second_stage", [0, 3])
-def test_manual_scalar_task_keeps_conservative_read_dependencies(second_stage):
-    before, operations = _scalar_state_loop([0, 0, second_stage, second_stage])
-    loop = before["main"].body.block.body.body
-    grouped = seq(
-        unit(seq(*operations[:2]), core=1, stage=0, cost=(2, 2)),
-        unit(seq(*operations[2:]), core=1, stage=second_stage, cost=(2, 2)),
-    )
-    loop = tirx.For(loop.loop_var, loop.min, loop.extent, loop.kind, grouped, annotations=loop.annotations)
-    block = before["main"].body.block
-    before = kernel(unit(loop, core=None, stage=-1), buffers=list(block.alloc_buffers), params=list(before["main"].buffer_map.values()))
-    # Whole-task access summaries retain each read even after a local write.
-    # The resulting update chain cannot span nonadjacent physical rounds.
-    if second_stage == 3:
-        with pytest.raises(RuntimeError, match="Manual schedule constraints are infeasible"):
-            transform.AutoSchedule()(before)
-        return
-    after = transform.AutoSchedule()(before)
-    children = after["main"].body.block.body.body.body.seq
-    assert [int(child.node["stage"]) for child in children] == [0, second_stage]
-    for child, expected in zip(children, [seq(*operations[:2]), seq(*operations[2:])]):
-        tvm.ir.assert_structural_equal(child.body.body, expected)

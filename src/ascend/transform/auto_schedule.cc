@@ -57,7 +57,6 @@
 #include "./auto_schedule/dependency_analysis.h"
 #include "./auto_schedule/ir_structure.h"
 #include "./auto_schedule/kernel_rewriter.h"
-#include "./auto_schedule/memory_detector.h"
 #include "./auto_schedule/multi_buffer.h"
 #include "./auto_schedule/scheduled_tir.h"
 #include "./auto_schedule/task_analysis.h"
@@ -91,36 +90,33 @@ constexpr uint16_t kConfigurationRegisters =
 
 using PhaseDependency = std::tuple<int64_t, int64_t, int64_t, int64_t>;
 
-struct SingleState {
-  uint16_t reg{0};
-  Optional<Var> storage;
-
-  bool MustWrite(const Stmt &stmt) const {
-    if (const auto *attr = stmt.as<AttrStmtNode>())
-      return MustWrite(attr->body);
-    if (const auto *seq = stmt.as<SeqStmtNode>())
-      return std::any_of(seq->seq.begin(), seq->seq.end(),
-                         [&](const Stmt &child) { return MustWrite(child); });
-    if (const auto *branch = stmt.as<IfThenElseNode>())
-      return branch->else_case.defined() && MustWrite(branch->then_case) &&
-             MustWrite(branch->else_case.value());
-    const auto *evaluate = stmt.as<EvaluateNode>();
-    const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
-    if (!call || !(AnalyzeSpecialRegisterWrites(stmt) & reg))
+bool MustSetRegister(const Stmt &stmt, uint16_t reg) {
+  if (const auto *attr = stmt.as<AttrStmtNode>())
+    return MustSetRegister(attr->body, reg);
+  if (const auto *seq = stmt.as<SeqStmtNode>())
+    return std::any_of(
+        seq->seq.begin(), seq->seq.end(),
+        [&](const Stmt &child) { return MustSetRegister(child, reg); });
+  if (const auto *branch = stmt.as<IfThenElseNode>())
+    return branch->else_case.defined() &&
+           MustSetRegister(branch->then_case, reg) &&
+           MustSetRegister(branch->else_case.value(), reg);
+  const auto *evaluate = stmt.as<EvaluateNode>();
+  const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+  if (!call || !(AnalyzeSpecialRegisterWrites(stmt) & reg))
+    return false;
+  // Only an executed setter kills the old value. A setter nested in an
+  // argument (for example if_then_else) need not execute.
+  for (const PrimExpr &arg : call->args) {
+    if (AnalyzeSpecialRegisterWrites(Evaluate(arg)) & reg)
       return false;
-    // A write nested in an argument (for example if_then_else) need not
-    // execute. Only the call's own configuration effect is a definite kill.
-    for (const PrimExpr &arg : call->args) {
-      if (AnalyzeSpecialRegisterWrites(Evaluate(arg)) & reg)
-        return false;
-    }
-    return true;
   }
-};
+  return true;
+}
 
-struct StateAccess {
-  // Task reads conservatively consume the incoming value, even if the task
-  // also writes it. Control nodes compose their children in logical order.
+struct RegisterAccess {
+  // Setters overwrite the register. Nested control nodes can also consume
+  // its incoming value before reaching a setter.
   bool reads{false};
   bool writes{false};
   bool must_write{false};
@@ -128,38 +124,19 @@ struct StateAccess {
 
 CoreMask NodeCoreMask(const IRStructure *node);
 
-StateAccess SummarizeState(const IRStructure *node, const SingleState &state,
-                           CoreMask core) {
-  StateAccess result;
+RegisterAccess SummarizeRegister(const IRStructure *node, uint16_t reg,
+                                 CoreMask core) {
+  RegisterAccess result;
   if (!(NodeCoreMask(node) & core))
     return result;
   if (node->IsTask()) {
     const auto *task = static_cast<const TaskNode *>(node);
-    if (state.storage.defined()) {
-      MemoryAccessDetector detector(
-          MemoryAccessDetector::AccessMode::kPhysical);
-      detector.Analyze(task->stmt);
-      auto touches = [&](const std::vector<BufferRegion> &regions) {
-        return std::any_of(
-            regions.begin(), regions.end(), [&](const BufferRegion &region) {
-              return region->buffer->data.same_as(state.storage.value());
-            });
-      };
-      result = {touches(detector.GetReadRegions()),
-                touches(detector.GetWriteRegions()),
-                touches(detector.GetMustWriteRegions())};
-      for (const Var &storage : detector.GetOpaqueAccessVars()) {
-        if (storage.same_as(state.storage.value()))
-          result = {true, true, false};
-      }
-    } else {
-      result = {(node->GetSpecialReadMask() & state.reg) != 0,
-                (node->GetSpecialWriteMask() & state.reg) != 0,
-                state.MustWrite(task->stmt)};
-    }
+    result = {(node->GetSpecialReadMask() & reg) != 0,
+              (node->GetSpecialWriteMask() & reg) != 0,
+              MustSetRegister(task->stmt, reg)};
   } else {
     const auto *control = static_cast<const ControlNode *>(node);
-    result = SummarizeState(control->task.get(), state, core);
+    result = SummarizeRegister(control->task.get(), reg, core);
     std::vector<IRStructure *> children;
     for (const auto &child : control->children)
       children.push_back(child.get());
@@ -170,7 +147,7 @@ StateAccess SummarizeState(const IRStructure *node, const SingleState &state,
                        return a->GetStage() < b->GetStage();
                      });
     for (const IRStructure *child : children) {
-      StateAccess access = SummarizeState(child, state, core);
+      RegisterAccess access = SummarizeRegister(child, reg, core);
       result.reads |= access.reads && !result.must_write;
       result.writes |= access.writes;
       result.must_write |= access.must_write;
@@ -178,13 +155,11 @@ StateAccess SummarizeState(const IRStructure *node, const SingleState &state,
     const auto *extent = control->control->extent.as<IntImmNode>();
     result.must_write &= extent && extent->value > 0;
   }
-  if (state.storage.defined())
-    result.reads |= node->GuardsTouchStorage(state.storage.value());
   result.must_write &= !node->HasConditions();
   return result;
 }
 
-bool HasUnknownStateEffects(const IRStructure *node) {
+bool HasUnknownRegisterEffects(const IRStructure *node) {
   auto opaque = [](const ObjectRef &ir) {
     bool found = false;
     PostOrderVisit(ir, [&](const ObjectRef &object) {
@@ -225,19 +200,19 @@ bool HasUnknownStateEffects(const IRStructure *node) {
   return opaque(control->task->stmt) ||
          std::any_of(control->children.begin(), control->children.end(),
                      [](const auto &child) {
-                       return HasUnknownStateEffects(child.get());
+                       return HasUnknownRegisterEffects(child.get());
                      });
 }
 
 // Bind each read to its reaching definition in logical stage order, then
-// protect that generation until the next physical overwrite. A single state
+// protect that generation until the next setter. A configuration register
 // has no ring of versions: each value must be consumed within one physical II.
 // Unlike all-pairs logical WAW edges, these edges allow independent generations
 // to interleave across any number of stages without changing their readers.
-bool AddSingleStateDependencies(const std::vector<StateAccess> &accesses,
-                                const std::vector<int64_t> &stages,
-                                const std::vector<int64_t> &latencies,
-                                std::vector<PhaseDependency> *deps) {
+bool AddRegisterPhaseDependencies(const std::vector<RegisterAccess> &accesses,
+                                  const std::vector<int64_t> &stages,
+                                  const std::vector<int64_t> &latencies,
+                                  std::vector<PhaseDependency> *deps) {
   std::vector<size_t> writers, logical;
   for (size_t i = 0; i < accesses.size(); ++i) {
     if (accesses[i].writes) {
@@ -256,7 +231,7 @@ bool AddSingleStateDependencies(const std::vector<StateAccess> &accesses,
                    [&](size_t a, size_t b) { return stages[a] < stages[b]; });
   auto add = [&](size_t u, size_t v, int64_t wrap, int64_t gap) {
     ICHECK(wrap == 0 || wrap == 1)
-        << "Manual schedule constraints are infeasible: a single-state read "
+        << "Manual schedule constraints are infeasible: a register read "
            "would cross a physical overwrite; check T.Stage values";
     // Reconstruction sorts equal phases by descending stage, then source
     // position. Preserve a required edge when that tie order would reverse it.
@@ -1001,7 +976,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
       data_deps; // (i, j, distance, latency)
   std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
-      state_phase_deps; // (i, j, physical wrap, latency)
+      register_phase_deps; // (i, j, physical wrap, latency)
   std::vector<std::pair<int64_t, int64_t>> resource_deps;
   std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>
       owner_exclusion_deps;
@@ -1169,75 +1144,33 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   }
 
   uint16_t phase_mask = 0;
-  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> phase_storages;
   if (manual_schedule && enable_offset &&
-      !std::any_of(nodes.begin(), nodes.end(), HasUnknownStateEffects)) {
-    auto add_state = [&](const SingleState &state) {
-      std::vector<PhaseDependency> state_deps;
+      !std::any_of(nodes.begin(), nodes.end(), HasUnknownRegisterEffects)) {
+    auto add_register = [&](uint16_t reg) {
+      std::vector<PhaseDependency> register_deps;
       bool has_writer = false;
       for (CoreMask core : kConcreteCores) {
-        std::vector<StateAccess> accesses(n);
+        std::vector<RegisterAccess> accesses(n);
         bool core_has_writer = false;
         for (size_t i = 0; i < n; ++i) {
           if (NodeCoreMask(nodes[i]) & core)
-            accesses[i] = SummarizeState(nodes[i], state, core);
+            accesses[i] = SummarizeRegister(nodes[i], reg, core);
           core_has_writer |= accesses[i].writes;
         }
         if (!core_has_writer)
           continue;
         has_writer = true;
-        if (!AddSingleStateDependencies(accesses, manual_stages, latencies,
-                                        &state_deps))
+        if (!AddRegisterPhaseDependencies(accesses, manual_stages, latencies,
+                                          &register_deps))
           return false;
       }
-      state_phase_deps.insert(state_phase_deps.end(), state_deps.begin(),
-                              state_deps.end());
+      register_phase_deps.insert(register_phase_deps.end(),
+                                 register_deps.begin(), register_deps.end());
       return has_writer;
     };
     for (uint16_t bit = 1; bit != 0; bit <<= 1) {
-      if ((kConfigurationRegisters & bit) && add_state({bit, std::nullopt}))
+      if ((kConfigurationRegisters & bit) && add_register(bit))
         phase_mask |= bit;
-    }
-    std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual>
-        scalar_storages;
-    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> non_scalar_storages;
-    for (const IRStructure *node : nodes) {
-      auto regions = node->GetWriteRegions();
-      auto reads = node->GetReadRegions();
-      regions.insert(regions.end(), reads.begin(), reads.end());
-      for (const auto &region : regions) {
-        const Buffer &buffer = region->buffer;
-        if (buffer.scope() == "local.var" && buffer->shape.size() == 1 &&
-            is_one(buffer->shape[0])) {
-          auto [it, inserted] = scalar_storages.emplace(buffer->data, buffer);
-          if (!inserted && !it->second.same_as(buffer))
-            non_scalar_storages.insert(buffer->data);
-        } else {
-          non_scalar_storages.insert(buffer->data);
-        }
-      }
-    }
-    LetDependencyClosure let_closure = CollectLetDependencyClosure_(nodes);
-    for (const auto &entry : scalar_storages) {
-      const Var &storage = entry.first;
-      // Explicit rings and aliased views keep buffer-region semantics: a
-      // differently typed or offset alias may write only part of a value.
-      if (non_scalar_storages.count(storage) ||
-          manual_buffer_versions_.count(storage) ||
-          buffer_version_overrides_.count(storage) ||
-          ctrl->IsMultiBufferEligible(storage))
-        continue;
-      // Cross-stage Bind copies re-read storage in their consumer's stage.
-      // Keep the existing snapshot constraints until those copies have their
-      // own explicit reaching-definition identity.
-      bool copied_read = false;
-      for (size_t u = 0; u < n; ++u) {
-        for (size_t l : let_closure.dependencies[u])
-          copied_read |= manual_stages[u] != manual_stages[l] &&
-                         nodes[l]->ReadsStorage(storage);
-      }
-      if (!copied_read && add_state({0, storage}))
-        phase_storages.insert(storage);
     }
   }
   auto add_register_dep = [&](size_t u, size_t v, int wrap, int64_t latency,
@@ -1283,9 +1216,6 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
     node_idx[nodes[i]] = i;
   }
   for (const auto &dep : deps) {
-    if (dep.kind == DependencyKind::kData && dep.storage.defined() &&
-        phase_storages.count(dep.storage.value()))
-      continue;
     size_t i = node_idx[dep.prod_node];
     size_t j = node_idx[dep.cons_node];
     int64_t latency = GetDependencyLatency(dep);
@@ -1385,9 +1315,9 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
   ffi::Array<ffi::Array<int64_t>> tvm_pipe_order_deps;
   ffi::Array<int64_t> tvm_storage_sizes;
   ffi::Array<int64_t> tvm_manual_stages;
-  ffi::Array<ffi::Array<int64_t>> tvm_state_phase_deps;
-  for (const auto &[u, v, wrap, latency] : state_phase_deps)
-    tvm_state_phase_deps.push_back({u, v, wrap, latency});
+  ffi::Array<ffi::Array<int64_t>> tvm_register_phase_deps;
+  for (const auto &[u, v, wrap, latency] : register_phase_deps)
+    tvm_register_phase_deps.push_back({u, v, wrap, latency});
 
   for (auto val : latencies) {
     tvm_latencies.push_back(val);
@@ -1461,7 +1391,7 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
                    tvm_data_deps, tvm_resource_deps, tvm_owner_exclusion_deps,
                    tvm_pipe_order_deps, tvm_storage_sizes, tvm_memory_groups,
                    tvm_stage_order_deps, enable_offset, tvm_manual_stages,
-                   manual_schedule, tvm_state_phase_deps)
+                   manual_schedule, tvm_register_phase_deps)
           .cast<ffi::Tuple<ffi::Array<int64_t>, ffi::Array<int>, int64_t>>();
 
   ffi::Array<int64_t> start_times = return_val.get<0>();
