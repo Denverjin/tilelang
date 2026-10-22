@@ -90,53 +90,57 @@ constexpr uint16_t kConfigurationRegisters =
 
 using PhaseDependency = std::tuple<int64_t, int64_t, int64_t, int64_t>;
 
-bool MustSetRegister(const Stmt &stmt, uint16_t reg) {
+uint16_t MustWriteConfigurationRegisters(const Stmt &stmt) {
   if (const auto *attr = stmt.as<AttrStmtNode>())
-    return MustSetRegister(attr->body, reg);
-  if (const auto *seq = stmt.as<SeqStmtNode>())
-    return std::any_of(
-        seq->seq.begin(), seq->seq.end(),
-        [&](const Stmt &child) { return MustSetRegister(child, reg); });
+    return MustWriteConfigurationRegisters(attr->body);
+  if (const auto *seq = stmt.as<SeqStmtNode>()) {
+    uint16_t mask = 0;
+    for (const Stmt &child : seq->seq)
+      mask |= MustWriteConfigurationRegisters(child);
+    return mask;
+  }
   if (const auto *branch = stmt.as<IfThenElseNode>())
-    return branch->else_case.defined() &&
-           MustSetRegister(branch->then_case, reg) &&
-           MustSetRegister(branch->else_case.value(), reg);
+    return branch->else_case.defined()
+               ? MustWriteConfigurationRegisters(branch->then_case) &
+                     MustWriteConfigurationRegisters(branch->else_case.value())
+               : 0;
   const auto *evaluate = stmt.as<EvaluateNode>();
   const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
-  if (!call || !(AnalyzeSpecialRegisterWrites(stmt) & reg))
-    return false;
+  if (!call)
+    return 0;
+  uint16_t mask = AnalyzeSpecialRegisterWrites(stmt) & kConfigurationRegisters;
+  if (mask == 0)
+    return 0;
   // Only an executed setter kills the old value. A setter nested in an
   // argument (for example if_then_else) need not execute.
-  for (const PrimExpr &arg : call->args) {
-    if (AnalyzeSpecialRegisterWrites(Evaluate(arg)) & reg)
-      return false;
-  }
-  return true;
+  for (const PrimExpr &arg : call->args)
+    mask &= ~AnalyzeSpecialRegisterWrites(Evaluate(arg));
+  return mask;
 }
 
-struct RegisterAccess {
-  // Setters overwrite the register. Nested control nodes can also consume
-  // its incoming value before reaching a setter.
-  bool reads{false};
-  bool writes{false};
-  bool must_write{false};
+// Effects on hardware configuration only. Ordinary scalar storage and variables
+// use the existing buffer-region and definition-use dependencies.
+struct ConfigurationEffects {
+  uint16_t read_mask{0}; // Incoming values that may be read.
+  uint16_t write_mask{0};
+  uint16_t must_write_mask{0};
 };
 
 CoreMask NodeCoreMask(const IRStructure *node);
 
-RegisterAccess SummarizeRegister(const IRStructure *node, uint16_t reg,
-                                 CoreMask core) {
-  RegisterAccess result;
+ConfigurationEffects SummarizeConfigurationEffects(const IRStructure *node,
+                                                   CoreMask core) {
+  ConfigurationEffects result;
   if (!(NodeCoreMask(node) & core))
     return result;
   if (node->IsTask()) {
     const auto *task = static_cast<const TaskNode *>(node);
-    result = {(node->GetSpecialReadMask() & reg) != 0,
-              (node->GetSpecialWriteMask() & reg) != 0,
-              MustSetRegister(task->stmt, reg)};
+    result.read_mask = node->GetSpecialReadMask() & kConfigurationRegisters;
+    result.write_mask = node->GetSpecialWriteMask() & kConfigurationRegisters;
+    result.must_write_mask = MustWriteConfigurationRegisters(task->stmt);
   } else {
     const auto *control = static_cast<const ControlNode *>(node);
-    result = SummarizeRegister(control->task.get(), reg, core);
+    result = SummarizeConfigurationEffects(control->task.get(), core);
     std::vector<IRStructure *> children;
     for (const auto &child : control->children)
       children.push_back(child.get());
@@ -147,19 +151,21 @@ RegisterAccess SummarizeRegister(const IRStructure *node, uint16_t reg,
                        return a->GetStage() < b->GetStage();
                      });
     for (const IRStructure *child : children) {
-      RegisterAccess access = SummarizeRegister(child, reg, core);
-      result.reads |= access.reads && !result.must_write;
-      result.writes |= access.writes;
-      result.must_write |= access.must_write;
+      ConfigurationEffects effects = SummarizeConfigurationEffects(child, core);
+      result.read_mask |= effects.read_mask & ~result.must_write_mask;
+      result.write_mask |= effects.write_mask;
+      result.must_write_mask |= effects.must_write_mask;
     }
     const auto *extent = control->control->extent.as<IntImmNode>();
-    result.must_write &= extent && extent->value > 0;
+    if (!extent || extent->value <= 0)
+      result.must_write_mask = 0;
   }
-  result.must_write &= !node->HasConditions();
+  if (node->HasConditions())
+    result.must_write_mask = 0;
   return result;
 }
 
-bool HasUnknownRegisterEffects(const IRStructure *node) {
+bool HasUnknownConfigurationEffects(const IRStructure *node) {
   auto opaque = [](const ObjectRef &ir) {
     bool found = false;
     PostOrderVisit(ir, [&](const ObjectRef &object) {
@@ -200,7 +206,7 @@ bool HasUnknownRegisterEffects(const IRStructure *node) {
   return opaque(control->task->stmt) ||
          std::any_of(control->children.begin(), control->children.end(),
                      [](const auto &child) {
-                       return HasUnknownRegisterEffects(child.get());
+                       return HasUnknownConfigurationEffects(child.get());
                      });
 }
 
@@ -209,24 +215,24 @@ bool HasUnknownRegisterEffects(const IRStructure *node) {
 // has no ring of versions: each value must be consumed within one physical II.
 // Unlike all-pairs logical WAW edges, these edges allow independent generations
 // to interleave across any number of stages without changing their readers.
-bool AddRegisterPhaseDependencies(const std::vector<RegisterAccess> &accesses,
-                                  const std::vector<int64_t> &stages,
-                                  const std::vector<int64_t> &latencies,
-                                  std::vector<PhaseDependency> *deps) {
+bool AddConfigurationPhaseDependencies(
+    const std::vector<ConfigurationEffects> &effects, uint16_t reg,
+    const std::vector<int64_t> &stages, const std::vector<int64_t> &latencies,
+    std::vector<PhaseDependency> *deps) {
   std::vector<size_t> writers, logical;
-  for (size_t i = 0; i < accesses.size(); ++i) {
-    if (accesses[i].writes) {
+  for (size_t i = 0; i < effects.size(); ++i) {
+    if (effects[i].write_mask & reg) {
       // A conditional kill may leave an older generation live. Retain the
       // conservative logical dependencies until that reaching definition is
       // known, rather than assuming that the skipped writer reset the state.
-      if (!accesses[i].must_write)
+      if (!(effects[i].must_write_mask & reg))
         return false;
       writers.push_back(i);
     }
     logical.push_back(i);
   }
   if (writers.empty())
-    return false;
+    return true;
   std::stable_sort(logical.begin(), logical.end(),
                    [&](size_t a, size_t b) { return stages[a] < stages[b]; });
   auto add = [&](size_t u, size_t v, int64_t wrap, int64_t gap) {
@@ -240,7 +246,7 @@ bool AddRegisterPhaseDependencies(const std::vector<RegisterAccess> &accesses,
       gap = std::max<int64_t>(gap, 1);
     deps->emplace_back(u, v, wrap, gap);
   };
-  std::vector<size_t> next_writer(accesses.size());
+  std::vector<size_t> next_writer(effects.size());
   for (size_t k = 0; k < writers.size(); ++k) {
     size_t u = writers[k], v = writers[(k + 1) % writers.size()];
     next_writer[u] = v;
@@ -249,19 +255,19 @@ bool AddRegisterPhaseDependencies(const std::vector<RegisterAccess> &accesses,
   // The first read may consume the previous logical iteration's last write.
   size_t writer = writers.front();
   for (size_t i : logical) {
-    if (accesses[i].writes)
+    if (effects[i].write_mask & reg)
       writer = i;
   }
   int64_t distance = 1;
   for (size_t reader : logical) {
-    if (accesses[reader].reads) {
+    if (effects[reader].read_mask & reg) {
       int64_t wrap = distance + stages[reader] - stages[writer];
       size_t overwrite = next_writer[writer];
       int64_t overwrite_wrap = overwrite <= writer ? 1 : 0;
       add(writer, reader, wrap, latencies[writer]);
       add(reader, overwrite, overwrite_wrap - wrap, 0);
     }
-    if (accesses[reader].writes) {
+    if (effects[reader].write_mask & reg) {
       writer = reader;
       distance = 0;
     }
@@ -1145,32 +1151,31 @@ void ScheduleBuilder::Z3SchedulePythonLoop(ControlNode *ctrl,
 
   uint16_t phase_mask = 0;
   if (manual_schedule && enable_offset &&
-      !std::any_of(nodes.begin(), nodes.end(), HasUnknownRegisterEffects)) {
-    auto add_register = [&](uint16_t reg) {
-      std::vector<PhaseDependency> register_deps;
-      bool has_writer = false;
-      for (CoreMask core : kConcreteCores) {
-        std::vector<RegisterAccess> accesses(n);
-        bool core_has_writer = false;
-        for (size_t i = 0; i < n; ++i) {
-          if (NodeCoreMask(nodes[i]) & core)
-            accesses[i] = SummarizeRegister(nodes[i], reg, core);
-          core_has_writer |= accesses[i].writes;
-        }
-        if (!core_has_writer)
-          continue;
-        has_writer = true;
-        if (!AddRegisterPhaseDependencies(accesses, manual_stages, latencies,
-                                          &register_deps))
-          return false;
+      !std::any_of(nodes.begin(), nodes.end(),
+                   HasUnknownConfigurationEffects)) {
+    std::vector<std::vector<ConfigurationEffects>> core_effects;
+    uint16_t written_registers = 0;
+    for (CoreMask core : kConcreteCores) {
+      auto &effects = core_effects.emplace_back();
+      for (const IRStructure *node : nodes) {
+        effects.push_back(SummarizeConfigurationEffects(node, core));
+        written_registers |= effects.back().write_mask;
       }
+    }
+    for (uint16_t reg = 1; reg != 0; reg <<= 1) {
+      if (!(written_registers & reg))
+        continue;
+      std::vector<PhaseDependency> register_deps;
+      if (!std::all_of(core_effects.begin(), core_effects.end(),
+                       [&](const auto &effects) {
+                         return AddConfigurationPhaseDependencies(
+                             effects, reg, manual_stages, latencies,
+                             &register_deps);
+                       }))
+        continue;
+      phase_mask |= reg;
       register_phase_deps.insert(register_phase_deps.end(),
                                  register_deps.begin(), register_deps.end());
-      return has_writer;
-    };
-    for (uint16_t bit = 1; bit != 0; bit <<= 1) {
-      if ((kConfigurationRegisters & bit) && add_register(bit))
-        phase_mask |= bit;
     }
   }
   auto add_register_dep = [&](size_t u, size_t v, int wrap, int64_t latency,
