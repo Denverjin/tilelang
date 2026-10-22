@@ -6,8 +6,7 @@ import tilelang.testing
 from tilelang import tvm
 from tilelang.ascend import transform
 from tvm import tirx
-from testing.ascend._ir import calls, kernel, schedule, nodes, seq
-from testing.ascend.auto_schedule._scheduled_ir import unit
+from testing.ascend._ir import calls, schedule, nodes
 
 
 def _insert_sync(program):
@@ -17,46 +16,6 @@ def _insert_sync(program):
 
 def _event_count(mod, operation, pipe):
     return sum(call.args[0].value == pipe for call in calls(mod, "tl.ascend_" + operation + "_flag"))
-
-
-@pytest.mark.parametrize("scope,cross", [("root", False), ("loop", False), ("loop", True), ("nested", None)])
-@pytest.mark.parametrize("regions", [False, True], ids=["storage", "region"])
-@pytest.mark.parametrize("disable_reuse", [False, True])
-def test_conflict_hints_permit_pairwise_storage_reuse(scope, cross, regions, disable_reuse):
-    a, b, c = [tirx.decl_buffer((8,), "int32", name=name, scope="shared.dyn") for name in ("a", "b", "c")]
-    out = tirx.decl_buffer((1,), "int32", name="out")
-
-    def operand(buffer):
-        return tirx.BufferRegion(buffer, [tvm.ir.Range(0, 4)]) if regions else buffer.data
-
-    def hint(left, right, positive=True):
-        return [operand(left), operand(right), tirx.IntImm("int32", -1 if cross is None else int(cross)), tirx.IntImm("bool", positive)]
-
-    hints = [hint(a, b), hint(b, c), hint(a, b), hint(b, b), hint(a, c, False)]
-    # All three values stay live until the final read, so ordinary lifetime
-    # inference cannot authorize reuse. Equal values make the declared reuse
-    # valid without changing the result.
-    body = seq(
-        *(unit(tirx.BufferStore(buffer, 1, [0]), core=1) for buffer in (a, b, c)),
-        unit(tirx.BufferStore(out, a[0] + b[0] + c[0], [0]), core=1),
-    )
-    annotations = {"tl.root_conflict_hints": hints} if scope == "root" else {}
-    if scope != "root":
-        loop = tirx.For(tirx.Var("i", "int32"), 0, 2, tirx.ForKind.SERIAL, body, annotations={"conflict_hint": hints})
-        body = unit(loop, core=None)
-        if scope == "nested":
-            body = unit(tirx.For(tirx.Var("j", "int32"), 0, 2, tirx.ForKind.SERIAL, body), core=None)
-    before = kernel(body, buffers=[a, b, c], params=[out], annotations=annotations)
-    with tvm.transform.PassContext(config={"tl.disable_shared_memory_reuse": disable_reuse}):
-        after = transform.InsertSync()(before)
-    (aliases,) = [
-        block.annotations["tl.buffer_alias_map"] for block in nodes(after, tirx.SBlock) if "tl.buffer_alias_map" in block.annotations
-    ]
-    expected = [] if disable_reuse else [(a.data, b.data), (b.data, a.data), (b.data, c.data), (c.data, b.data)]
-    actual = [(storage, other) for storage, partners in aliases.items() for other in partners]
-    assert len(actual) == len(expected)
-    for lhs, rhs in expected:
-        assert any(storage.same_as(lhs) and other.same_as(rhs) for storage, other in actual)
 
 
 def _hint_program(scope, exact, cross, explicit_root):

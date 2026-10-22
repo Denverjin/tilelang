@@ -47,8 +47,7 @@ constexpr const char *kAivStorageMap = "tl.aiv_storage_map";
 constexpr const char *kSplitSubcores = "tl.split_subcores";
 using AivStorageMap = ffi::Map<tirx::Var, Integer>;
 
-/*! \brief Storage data Var -> inferred or explicitly permitted alias partners.
- */
+/*! \brief Storage data Var -> storages proven safe to alias with it. */
 using BufferAliasMap = ffi::Map<tirx::Var, ffi::Array<tirx::Var>>;
 
 inline void AddBufferAliasStorage(BufferAliasMap *aliases,

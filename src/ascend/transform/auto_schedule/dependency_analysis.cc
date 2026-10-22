@@ -120,8 +120,8 @@ bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
                         ControlNode *loop, int offset,
                         size_t num_storage_owners,
                         const ConflictHintList &root_conflicts,
-                        Optional<PrimExpr> a_pitch, Optional<PrimExpr> b_pitch,
-                        bool shared_reuse_ring) {
+                        Optional<PrimExpr> a_pitch,
+                        Optional<PrimExpr> b_pitch) {
   const bool cross = offset != 0;
   if (cross && loop == nullptr)
     return false;
@@ -147,8 +147,7 @@ bool RegionsMayConflict(const ConstrSet &a_ctx, const BufferRegion &a_region,
   if (declared_no_conflict)
     return false;
 
-  if (!shared_reuse_ring &&
-      !a_region->buffer->data.same_as(b_region->buffer->data))
+  if (!a_region->buffer->data.same_as(b_region->buffer->data))
     return false;
 
   // Same storage but different logical buffer (T.view/T.reshape): regions may
@@ -256,8 +255,7 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
                     const BufferVersionMap &manual_buffer_versions,
                     const MultiBufferOwnerMap &multi_buffer_owners,
                     DependencyCache *dependency_cache,
-                    const ConflictHintList &root_conflicts,
-                    const L0StorageGroups &storage_groups) {
+                    const ConflictHintList &root_conflicts) {
   DependencyCache local_cache;
   DependencyCache &cache = dependency_cache ? *dependency_cache : local_cache;
   if (loop) {
@@ -301,9 +299,9 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
         std::vector<IRStructure *> children;
         for (const auto &child : ctrl->children)
           children.push_back(child.get());
-        auto child_deps = AnalyzeDependencies(
-            children, ctrl, manual_buffer_versions, multi_buffer_owners, &cache,
-            root_conflicts, storage_groups);
+        auto child_deps =
+            AnalyzeDependencies(children, ctrl, manual_buffer_versions,
+                                multi_buffer_owners, &cache, root_conflicts);
         for (const auto &cdep : child_deps) {
           auto &covered_pairs = out[cdep.storage];
           covered_pairs.insert(cdep.task_pairs.begin(), cdep.task_pairs.end());
@@ -409,12 +407,8 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
             const Var &lhs_storage = lhs.region->buffer->data;
             const Var &rhs_storage = rhs.region->buffer->data;
             ffi::Optional<Var> storage;
-            bool shared_reuse_ring =
-                storage_groups.SharesReuseRing(lhs_storage, rhs_storage);
             if (lhs_storage.same_as(rhs_storage))
               storage = lhs_storage;
-            else if (shared_reuse_ring)
-              storage = storage_groups.Representative(lhs_storage);
             bool owner_exclusion =
                 is_owner_exclusion(storage, lhs.task, rhs.task);
             // The i<j visit sees every cross-owner write/read, write/write,
@@ -429,8 +423,7 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
                                        rhs.task->outer_ctx, rhs.region, loop, d,
                                        /*num_storage_owners=*/0, root_conflicts,
                                        lhs.task->GetL0Pitch(lhs_storage),
-                                       rhs.task->GetL0Pitch(rhs_storage),
-                                       shared_reuse_ring)) {
+                                       rhs.task->GetL0Pitch(rhs_storage))) {
                   add_pair(storage, d, lhs.task, rhs.task);
                   break;
                 }
@@ -442,12 +435,12 @@ AnalyzeDependencies(std::vector<IRStructure *> nodes, ControlNode *loop,
                 continue;
               if (distance < 0 && loop == nullptr)
                 continue;
-              if (RegionsMayConflict(
-                      lhs.task->outer_ctx, lhs.region, rhs.task->outer_ctx,
-                      rhs.region, loop, distance,
-                      get_num_storage_owners(storage), root_conflicts,
-                      lhs.task->GetL0Pitch(lhs_storage),
-                      rhs.task->GetL0Pitch(rhs_storage), shared_reuse_ring)) {
+              if (RegionsMayConflict(lhs.task->outer_ctx, lhs.region,
+                                     rhs.task->outer_ctx, rhs.region, loop,
+                                     distance, get_num_storage_owners(storage),
+                                     root_conflicts,
+                                     lhs.task->GetL0Pitch(lhs_storage),
+                                     rhs.task->GetL0Pitch(rhs_storage))) {
                 add_pair(storage, owner_exclusion ? 0 : distance, lhs.task,
                          rhs.task,
                          owner_exclusion ? DependencyKind::kOwnerExclusion

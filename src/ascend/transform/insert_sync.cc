@@ -831,7 +831,7 @@ public:
 
     BufferAliasAnalyzer buffer_alias_analyzer(*this, storage_groups_);
     buffer_alias_analyzer.Collect(root);
-    buffer_alias_analyzer.Analyze(root, root_conflicts_);
+    buffer_alias_analyzer.Analyze(root);
     buffer_alias_analyzer.Validate();
     buffer_aliases_ = buffer_alias_analyzer.GetAliases();
   }
@@ -1250,9 +1250,9 @@ private:
   std::vector<SyncPoint>
   CollectSyncPoints(const std::vector<IRStructure *> &nodes,
                     ControlNode *loop) {
-    std::vector<DepInfo> deps = AnalyzeDependencies(
-        nodes, loop, manual_, multi_buffer_owners_, &dependency_cache_,
-        root_conflicts_, storage_groups_);
+    std::vector<DepInfo> deps =
+        AnalyzeDependencies(nodes, loop, manual_, multi_buffer_owners_,
+                            &dependency_cache_, root_conflicts_);
     if (loop != nullptr) {
       std::vector<DepInfo> directed_deps;
       directed_deps.reserve(deps.size() * 2);
@@ -2532,8 +2532,8 @@ SBlock InsertKernelSync(const Stmt &kernel_body, ScheduledTIR scheduled_tir) {
   std::vector<std::shared_ptr<IRStructure>> &root = scheduled_tir.tree;
   int num_aiv_subcores = scheduled_tir.metadata.num_aiv_subcores.value_or(2);
   CoreMask vector_mask = VectorCoreMask(num_aiv_subcores);
-  L0StorageGroups groups =
-      CollectL0StorageGroups(scheduled_tir.metadata.kernel_root);
+  L0StorageGroups groups(
+      CollectL0SFBindings(scheduled_tir.metadata.kernel_root));
   MultiBufferPlan multi_buffer_plan =
       ReadMultiBufferPlan(root, scheduled_tir.metadata.buffer_versions, groups);
   std::vector<TaskNode *> tasks;

@@ -639,10 +639,11 @@ tvm::transform::Pass ResolveCore() {
         [](const TilelangKernelContext &context) {
           ScheduledTIR scheduled_tir =
               DecodeScheduledTIR(context.root, context.outer_ctx);
-          ResolveCoreMasks(
-              scheduled_tir.tree, scheduled_tir.metadata.buffer_versions,
-              context.outer_sid, CollectL0StorageGroups(context.root),
-              scheduled_tir.metadata.num_aiv_subcores.value_or(2));
+          ResolveCoreMasks(scheduled_tir.tree,
+                           scheduled_tir.metadata.buffer_versions,
+                           context.outer_sid,
+                           L0StorageGroups(CollectL0SFBindings(context.root)),
+                           scheduled_tir.metadata.num_aiv_subcores.value_or(2));
           return EncodeScheduledTIR(std::move(scheduled_tir));
         });
   };

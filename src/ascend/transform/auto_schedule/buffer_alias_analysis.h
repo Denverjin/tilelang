@@ -41,7 +41,6 @@
 
 #include "../buffer_alias.h"
 #include "./buffer_lifetime_analysis.h"
-#include "./dependency_analysis.h"
 #include "./ir_structure.h"
 #include "./memory_detector.h"
 #include "ascend/op/utils.h"
@@ -407,41 +406,15 @@ public:
     }
   }
 
-  void Analyze(const std::vector<std::shared_ptr<IRStructure>> &root,
-               const ConflictHintList &root_conflicts) {
+  void Analyze(const std::vector<std::shared_ptr<IRStructure>> &root) {
     lifetime_summaries_.clear();
     AnalyzeScope(root, /*loop=*/nullptr);
-    AddConflictAliases_(root_conflicts);
   }
 
   const BufferAliasMap &GetAliases() const { return buffer_aliases_; }
   void Validate() const { ValidateBufferAliasMap(buffer_aliases_); }
 
 private:
-  void AddConflictAliases_(const ConflictHintList &hints) {
-    auto storage = [](const ffi::Any &operand) -> Var {
-      if (auto var = operand.as<Var>())
-        return var.value();
-      return operand.cast<BufferRegion>()->buffer->data;
-    };
-    for (const ffi::Any &entry : hints) {
-      Array<ffi::Any> hint = entry.cast<Array<ffi::Any>>();
-      ICHECK_EQ(hint.size(), 4U);
-      if (!hint[3].cast<Bool>()->value)
-        continue;
-      Var lhs = storage(hint[0]);
-      Var rhs = storage(hint[1]);
-      if (!groups_.SharesReuseRing(lhs, rhs)) {
-        lhs = groups_.Representative(lhs);
-        rhs = groups_.Representative(rhs);
-      }
-      // A positive hint explicitly permits storage reuse. Its region and
-      // iteration qualifiers still control dependency analysis independently.
-      if (!lhs.same_as(rhs))
-        AddBufferAlias(&buffer_aliases_, lhs, rhs);
-    }
-  }
-
   HappensBeforeQuery MakeHappensBeforeQuery(ControlNode *scope) const {
     return [this, scope](size_t src, size_t dst, int64_t distance) {
       return context_->HappensBefore(scope, src, dst, distance);
@@ -456,10 +429,6 @@ private:
 
   void AnalyzeScope(const std::vector<std::shared_ptr<IRStructure>> &nodes,
                     ControlNode *loop) {
-    if (loop != nullptr) {
-      if (auto hints = loop->control->annotations.Get("conflict_hint"))
-        AddConflictAliases_(hints.value().cast<ConflictHintList>());
-    }
     // Cache every child scope before summarizing this scope. A parent can then
     // promote the child's already-built lifetime instead of recursively
     // rediscovering the same nested control chain.
@@ -1531,9 +1500,8 @@ public:
   void Collect(const std::vector<std::shared_ptr<IRStructure>> &root) {
     impl_.Collect(root);
   }
-  void Analyze(const std::vector<std::shared_ptr<IRStructure>> &root,
-               const ConflictHintList &root_conflicts = {}) {
-    impl_.Analyze(root, root_conflicts);
+  void Analyze(const std::vector<std::shared_ptr<IRStructure>> &root) {
+    impl_.Analyze(root);
   }
 
   const BufferAliasMap &GetAliases() const { return impl_.GetAliases(); }
