@@ -3,7 +3,7 @@
 import math
 
 import pytest
-from tilelang import tvm
+from tilelang import tvm, transform as tl_transform
 from tilelang.ascend import language as T, transform
 from tilelang.layout import (
     make_ascend_nz_layout,
@@ -52,7 +52,7 @@ def _lower(src, dst, src_region=None, dst_region=None, *, layouts=None, bindings
         mod = tvm.IRModule({"main": func})
         if normalize:
             mod = transform.NormalizeAscendFractalStorage()(mod)
-        return transform.AscendLowerTileOp()(mod)
+        return tl_transform.LowerAccessPtr()(transform.AscendLowerTileOp()(mod))
 
 
 def _equal(actual, expected):
@@ -297,7 +297,7 @@ def test_explicit_l0_pitch_controls_offsets_and_keeps_plane_capacity(v_layout, o
             with pytest.raises(ValueError, match="l0_pitch"):
                 transform.AscendLowerTileOp()(mod)
             return
-        after = transform.AscendLowerTileOp()(mod)
+        after = tl_transform.LowerAccessPtr()(transform.AscendLowerTileOp()(mod))
     loads = calls(after, "tl.ascend_load_cbuf_to_cb" if v_layout else "tl.ascend_load_cbuf_to_ca")
     _equal([load.args[7] for load in loads], [pitch, pitch])
     _equal([load.args[0].args[2] for load in loads], [4096, 4096 + 2 * pitch * 256])
