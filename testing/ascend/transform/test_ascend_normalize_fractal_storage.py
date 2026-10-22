@@ -35,7 +35,7 @@ def test_canonical_allocation_rounds_only_fractal_axes(shape, dtype, padded):
 
 
 @pytest.mark.parametrize("kind", ["view", "reshape", "reinterpret"])
-def test_alias_accesses_use_one_canonical_allocation(kind):
+def test_alias_accesses_preserve_views_on_one_allocation(kind):
     owner_shape = (15, 15) if kind == "view" else (225,)
     owner = tirx.decl_buffer(owner_shape, "uint16" if kind == "reinterpret" else "bfloat16", name="owner", scope="shared.l1")
     view = tirx.decl_buffer((15, 15), "bfloat16", data=owner.data)
@@ -43,7 +43,8 @@ def test_alias_accesses_use_one_canonical_allocation(kind):
     after = transform.NormalizeAscendFractalStorage()(before)
     allocation = after["main"].body.block.alloc_buffers[0]
     (store,) = nodes(after, tirx.BufferStore)
-    assert store.buffer.same_as(allocation)
+    assert not store.buffer.same_as(allocation)
+    assert store.buffer.data.same_as(allocation.data)
     assert allocation.data.same_as(owner.data)
     assert allocation.dtype == "bfloat16"
     assert tuple(int(x) for x in allocation.shape) == (16, 16)
@@ -61,7 +62,7 @@ def test_pointer_base_is_reexpressed_in_canonical_indices(raw):
     after = transform.NormalizeAscendFractalStorage()(before)
     (pointer,) = calls(after, "tl.access_ptr")
     load, extent, _ = pointer.args
-    assert load.buffer.same_as(after["main"].body.block.alloc_buffers[0])
+    assert load.buffer.data.same_as(after["main"].body.block.alloc_buffers[0].data)
     analyzer = tvm.arith.Analyzer()
     assert analyzer.can_prove_equal(load.indices[0], 1 if raw else row * 5)
     assert int(load.indices[1]) == 0 and int(extent) == 1
@@ -126,7 +127,7 @@ def test_alias_indices_and_access_regions_use_the_same_padded_storage():
     root = normalized["main"].body.block
     owner = root.alloc_buffers[0]
     alias = root.reads[0].buffer
-    assert owner.same_as(alias)
+    assert not owner.same_as(alias)
     assert owner.data.same_as(alias.data)
     assert tuple(int(x) for x in owner.shape) == tuple(int(x) for x in alias.shape) == (16, 16)
     assert [(int(r.min), int(r.extent)) for r in root.reads[0].region] == [(1, 2), (0, 15)]
@@ -158,7 +159,10 @@ def test_alias_normalization_preserves_allocation_properties():
     assert allocation.offset_factor == 8
     assert allocation.dtype == "bfloat16"
     assert tuple(int(x) for x in allocation.shape) == (16, 16)
-    assert allocation.same_as(normalized["main"].body.block.body.value.buffer)
+    view_buffer = normalized["main"].body.block.body.value.buffer
+    assert not allocation.same_as(view_buffer)
+    assert allocation.data.same_as(view_buffer.data)
+    assert allocation.name == "owner" and view_buffer.name == "view"
 
 
 @pytest.mark.parametrize(
@@ -188,9 +192,17 @@ def test_independent_cube_views_preserve_their_matrix_geometry(shape, view_shape
     tvm.ir.assert_structural_equal(after, transform.NormalizeAscendFractalStorage()(after))
 
 
-def test_cube_views_with_different_padded_sizes_are_rejected():
-    owner = tirx.decl_buffer((15, 16), "bfloat16", scope="shared.l0b")
-    view = tirx.decl_buffer((8, 30), "bfloat16", data=owner.data)
+@pytest.mark.parametrize(
+    "dtype,shape,view_shape,view_layout",
+    [
+        ("bfloat16", (15, 16), (8, 30), make_ascend_nz_layout),
+        # Both unpadded layouts cover 128 elements, but their Cube padding differs.
+        ("float32", (8, 16), (8, 16), make_ascend_major_mn_layout),
+    ],
+)
+def test_cube_views_with_different_padded_sizes_are_rejected(dtype, shape, view_shape, view_layout):
+    owner = tirx.decl_buffer(shape, dtype, scope="shared.l0b")
+    view = tirx.decl_buffer(view_shape, dtype, data=owner.data)
     block = tirx.SBlock(
         [],
         [],
@@ -198,13 +210,37 @@ def test_cube_views_with_different_padded_sizes_are_rejected():
         "root",
         tirx.Evaluate(view[0, 0]),
         alloc_buffers=[owner],
-        annotations={
-            "layout_map": {owner: tilelang.layout.make_ascend_major_k_layout(owner), view: tilelang.layout.make_ascend_major_k_layout(view)}
-        },
+        annotations={"layout_map": {owner: make_ascend_nz_layout(owner), view: view_layout(view)}},
     )
     before = tvm.IRModule({"main": tirx.PrimFunc([], tirx.SBlockRealize([], True, block))})
-    with pytest.raises(tvm.error.InternalError, match="equal padded physical sizes"):
+    with pytest.raises(tvm.error.InternalError, match="equal physical sizes including padding"):
         transform.NormalizeAscendFractalStorage()(before)
+
+
+@pytest.mark.parametrize("source", ["owner", "view"])
+@pytest.mark.parametrize("reverse_annotations", [False, True])
+def test_reshape_uses_its_layout_when_storage_has_distinct_matrix_views(source, reverse_annotations):
+    owner = tirx.decl_buffer((17, 32), "bfloat16", name="owner", scope="shared.l0b")
+    view = tirx.decl_buffer((32, 17), "bfloat16", name="view", data=owner.data)
+    reshaped = tirx.decl_buffer((544,), "bfloat16", name="reshaped", data=owner.data)
+    layouts = {owner: make_ascend_nz_layout(owner), view: make_ascend_major_mn_layout(view)}
+    matrix = owner if source == "owner" else view
+    layouts[reshaped] = layouts[matrix].reshape(reshaped.shape)
+    if reverse_annotations:
+        layouts = dict(reversed(list(layouts.items())))
+    body = tirx.SeqStmt([tirx.Evaluate(buf[1, 0]) for buf in (owner, view)] + [tirx.Evaluate(reshaped[35])])
+    before = kernel(body, buffers=[owner], annotations={"layout_map": layouts})
+    after = transform.NormalizeAscendFractalStorage()(before)
+    root = after["main"].body.block
+    read = root.body.seq[2].value
+    assert tuple(int(x) for x in read.indices) == ((1, 3) if source == "owner" else (2, 1))
+    assert tuple(int(x) for x in read.buffer.shape) == (32, 32)
+    assert read.buffer.name == "reshaped"
+    assert not read.buffer.same_as(root.alloc_buffers[0])
+    assert all(stmt.value.buffer.data.same_as(root.alloc_buffers[0].data) for stmt in root.body.seq)
+    expected = (make_ascend_nz_layout if source == "owner" else make_ascend_major_mn_layout)(read.buffer)
+    assert root.annotations["layout_map"][read.buffer].is_equal(expected)
+    tvm.ir.assert_structural_equal(after, transform.NormalizeAscendFractalStorage()(after))
 
 
 @pytest.mark.parametrize("raw", [False, True], ids=["typed-view", "ambiguous-data-pointer"])

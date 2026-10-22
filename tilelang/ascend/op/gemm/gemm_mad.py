@@ -41,19 +41,7 @@ def _make_access_ptr(buf, region, rw_mask, exclude_last=False):
 
 
 def _find_layout(layout_map, buf):
-    if layout_map is None:
-        return None
-    for key in (buf, buf.data if hasattr(buf, "data") else None):
-        if key is not None:
-            layout = layout_map.get(key)
-            if layout is not None:
-                return layout
-    for key, layout in layout_map.items():
-        if hasattr(key, "data") and hasattr(buf, "data") and key.data.same_as(buf.data):
-            return layout
-        if hasattr(key, "name") and getattr(key, "name", None) == getattr(buf, "name", None):
-            return layout
-    return None
+    return None if layout_map is None else layout_map.get(buf)
 
 
 _ASCEND_DTYPE_MAP = {

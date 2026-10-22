@@ -641,8 +641,8 @@ private:
           << "but got indices size: " << indices.size()
           << " and shape size: " << old_shape.size();
 
-      Buffer remap_key = FindRemapBuffer(load->buffer).value_or(load->buffer);
-      Optional<Layout> layout = FindLayout(remap_key);
+      Buffer remap_key = load->buffer;
+      Optional<Layout> layout = layout_map_.Get(remap_key);
       if (!layout.defined() || !buffer_map_.count(remap_key->data)) {
         return result;
       }
@@ -708,8 +708,8 @@ private:
           << "but got indices size: " << indices.size()
           << " and shape size: " << old_shape.size();
 
-      Buffer remap_key = FindRemapBuffer(load->buffer).value_or(load->buffer);
-      Optional<Layout> layout = FindLayout(remap_key);
+      Buffer remap_key = load->buffer;
+      Optional<Layout> layout = layout_map_.Get(remap_key);
       if (!layout.defined() || !buffer_map_.count(remap_key->data)) {
         return result;
       }
@@ -737,30 +737,24 @@ private:
       Array<PrimExpr> new_indices = RemapAccessIndices(
           indices, old_shape, new_shape, layout.value(), offset);
 
+      if (auto pitch = access_ptr_call->annotations.Get(attr::kL0AccessPitch)) {
+        ICHECK(IsL0ABuffer(remap_key) || IsL0BBuffer(remap_key));
+        size_t n = new_shape.size();
+        ICHECK_GE(n, 4);
+        // A compact L0 copy changes this access's matrix row stride, not the
+        // allocation or the distance between storage versions.
+        Array<PrimExpr> strides(n, Integer(1));
+        PrimExpr stride = Integer(1);
+        for (size_t i = n; i > 0; --i) {
+          strides.Set(i - 1, stride);
+          stride = stride * new_shape[i - 1];
+        }
+        strides.Set(n - 4, Downcast<PrimExpr>(pitch.value()) *
+                               new_shape[n - 2] * new_shape[n - 1]);
+        new_buffer.CopyOnWrite()->strides = std::move(strides);
+      }
       Array<PrimExpr> new_args = {BufferLoad(new_buffer, new_indices), extent,
                                   rw_mask};
-      if (IsAscendCubeBuffer(remap_key)) {
-        size_t n = new_shape.size();
-        PrimExpr physical_offset = 0;
-        for (size_t i = 0; i < n; ++i)
-          physical_offset = physical_offset * new_shape[i] + new_indices[i];
-        if (auto pitch =
-                access_ptr_call->annotations.Get(attr::kL0AccessPitch)) {
-          ICHECK(IsL0ABuffer(remap_key) || IsL0BBuffer(remap_key));
-          ICHECK_GE(n, 4);
-          physical_offset +=
-              new_indices[n - 4] *
-              (Downcast<PrimExpr>(pitch.value()) - new_shape[n - 3]) *
-              new_shape[n - 2] * new_shape[n - 1];
-        }
-        layout_remap_.Set(new_buffer, layout.value());
-        result.rewritten = true;
-        result.expr =
-            Call(access_ptr_call->dtype, builtin::tvm_access_ptr(),
-                 {TypeAnnotation(new_buffer->dtype), new_buffer->data,
-                  analyzer_->Simplify(physical_offset), extent, rw_mask});
-        return result;
-      }
       if (buffer_remap_.count(remap_key)) {
         layout_remap_.Set(new_buffer, layout.value());
       }
@@ -787,44 +781,6 @@ private:
       }
     }
     return Optional<PrimExpr>();
-  }
-
-  Optional<Buffer> FindRemapBuffer(const Buffer &buffer) const {
-    if (buffer_remap_.count(buffer)) {
-      return buffer;
-    }
-    auto it = buffer_map_.find(buffer->data);
-    if (it != buffer_map_.end() && buffer_remap_.count(it->second)) {
-      return it->second;
-    }
-    for (const auto &kv : buffer_remap_) {
-      if (kv.first->data.same_as(buffer->data)) {
-        return kv.first;
-      }
-      if (kv.first->name == buffer->name) {
-        return kv.first;
-      }
-    }
-    return Optional<Buffer>();
-  }
-
-  Optional<Layout> FindLayout(const Buffer &buffer) const {
-    if (layout_map_.count(buffer)) {
-      return layout_map_[buffer];
-    }
-    auto it = buffer_map_.find(buffer->data);
-    if (it != buffer_map_.end() && layout_map_.count(it->second)) {
-      return layout_map_[it->second];
-    }
-    for (const auto &kv : layout_map_) {
-      if (kv.first->data.same_as(buffer->data)) {
-        return kv.second;
-      }
-      if (kv.first->name == buffer->name) {
-        return kv.second;
-      }
-    }
-    return Optional<Layout>();
   }
 
   PrimExpr VisitExpr_(const tirx::CallNode *op) final {

@@ -75,11 +75,6 @@ inline bool IsAscendOnChipBuffer(const Buffer &buffer) {
          IsL0BBuffer(buffer) || IsL0CBuffer(buffer) || IsSSBuffer(buffer);
 }
 
-inline bool IsAscendCubeBuffer(const Buffer &buffer) {
-  return IsL1Buffer(buffer) || IsL0ABuffer(buffer) || IsL0BBuffer(buffer) ||
-         IsL0CBuffer(buffer);
-}
-
 /*!
  * \brief A view-preserving pointer whose innermost 2-D position travels as
  *        separate intrinsic arguments.
